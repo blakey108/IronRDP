@@ -16,10 +16,14 @@ pub mod rdp;
 #[cfg(feature = "video")]
 pub mod video;
 
+/// USB device redirection backend (MS-RDPEUSB), re-exported for device selection.
+#[cfg(feature = "usb")]
+pub use ironrdp_rdpeusb_native as usb;
+
 #[cfg(all(any(windows, target_os = "linux"), feature = "clipboard"))]
 mod clipboard;
 
 #[cfg(feature = "usb")]
-mod usb;
+mod urbdrc;
 
 mod ws;

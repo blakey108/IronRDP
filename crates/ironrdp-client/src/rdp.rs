@@ -2088,7 +2088,7 @@ fn build_connector(
     // URBDRC (MS-RDPEUSB) USB device redirection.
     #[cfg(feature = "usb")]
     if let Some(usb) = config.channels.usb.as_ref().filter(|usb| usb.is_enabled()) {
-        drdynvc = drdynvc.with_listener(crate::usb::urbdrc_listener(usb, input_sender.clone()));
+        drdynvc = drdynvc.with_listener(crate::urbdrc::urbdrc_listener(usb, input_sender.clone()));
     }
 
     // Clone the connector config so we can apply runtime overrides before handing it to the
@@ -3275,9 +3275,9 @@ fn urbdrc_iteration(
     active_stage: &mut ActiveStage,
     event: ironrdp_rdpeusb_native::UrbdrcEvent,
 ) -> SessionResult<ActiveSessionIteration> {
-    use crate::usb::UrbdrcOutput;
+    use crate::urbdrc::UrbdrcOutput;
 
-    Ok(match crate::usb::process_urbdrc_event(active_stage, event)? {
+    Ok(match crate::urbdrc::process_urbdrc_event(active_stage, event)? {
         UrbdrcOutput::Dvc(batch) => ActiveSessionIteration::dvc(batch),
         UrbdrcOutput::Frame(frame) => ActiveSessionIteration::outputs(vec![ActiveStageOutput::ResponseFrame(frame)]),
         UrbdrcOutput::Nothing => ActiveSessionIteration::outputs(Vec::new()),
