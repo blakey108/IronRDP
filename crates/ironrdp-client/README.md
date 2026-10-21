@@ -37,6 +37,10 @@ When the `gateway` feature is enabled and `Transport::Gateway` is selected, the 
 It handles `HTTP_REAUTH_MESSAGE` through a short-lived background reauthentication transport without disrupting the active data transport.
 The gateway path does not provide a live RPC-over-HTTP (RPCH) transport or RDG-UDP/DTLS side channel.
 
+The optional `usb` feature redirects local USB devices over MS-RDPEUSB (URBDRC) with the nusb backend from [`ironrdp-rdpeusb-native`](../ironrdp-rdpeusb-native).
+Select devices with `ConfigBuilder::with_usb_redirection` or the `.rdp` `usbdevicestoredirect` property.
+On Windows, only devices bound to the WinUSB driver can be redirected; see that crate for the coverage limits on each platform.
+
 For the end-user RDP client binary, see [`ironrdp-viewer`](../ironrdp-viewer).
 
 This crate is part of the [IronRDP] project.
