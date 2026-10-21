@@ -480,6 +480,9 @@ pub enum RdpInputEvent {
     RailExecute(ExecutePdu),
     /// Queues a client-originated RAIL input event.
     Rail(RailInputEvent),
+    /// Applies the result of USB redirection work done off the session loop.
+    #[cfg(feature = "usb")]
+    Urbdrc(ironrdp_rdpeusb_native::UrbdrcEvent),
 }
 
 /// Maximum number of ordinary input events retained while the session is unable to process them.
@@ -492,9 +495,13 @@ pub const RDP_INPUT_EVENT_QUEUE_CAPACITY: usize = 128;
 #[derive(Clone, Debug)]
 pub struct RdpInputSender {
     input_sender: mpsc::Sender<RdpInputEvent>,
+    /// Unbounded queue for ordered protocol events that must not be dropped (clipboard, USB).
     #[cfg_attr(
-        not(feature = "clipboard"),
-        expect(dead_code, reason = "clipboard input is unavailable without the clipboard feature")
+        not(any(feature = "clipboard", feature = "usb")),
+        expect(
+            dead_code,
+            reason = "ordered events are unavailable without the clipboard or usb feature"
+        )
     )]
     clipboard_sender: mpsc::UnboundedSender<RdpInputEvent>,
     close_sender: watch::Sender<bool>,
@@ -606,6 +613,17 @@ impl RdpInputSender {
     #[cfg(feature = "clipboard")]
     pub fn send_clipboard(&self, message: ClipboardMessage) -> Result<(), mpsc::error::SendError<RdpInputEvent>> {
         self.clipboard_sender.send(RdpInputEvent::Clipboard(message))
+    }
+
+    /// Enqueues a USB redirection event independently of ordinary bounded input.
+    ///
+    /// Dropping a USB completion would leave the server-side driver waiting for its request forever.
+    #[cfg(feature = "usb")]
+    pub fn send_urbdrc(
+        &self,
+        event: ironrdp_rdpeusb_native::UrbdrcEvent,
+    ) -> Result<(), mpsc::error::SendError<RdpInputEvent>> {
+        self.clipboard_sender.send(RdpInputEvent::Urbdrc(event))
     }
 
     /// Requests immediate session cancellation, bypassing the bounded input queue.
@@ -1838,7 +1856,8 @@ fn build_connector(
         all(windows, feature = "dvc-com-plugin"),
         feature = "sound",
         all(windows, feature = "webauthn"),
-        all(windows, feature = "camera")
+        all(windows, feature = "camera"),
+        feature = "usb"
     )))]
     let _ = input_sender;
     #[cfg(not(feature = "clipboard"))]
@@ -2064,6 +2083,12 @@ fn build_connector(
         drdynvc = drdynvc.with_listener(RdpeaiListener {
             sender: input_sender.clone(),
         });
+    }
+
+    // URBDRC (MS-RDPEUSB) USB device redirection.
+    #[cfg(feature = "usb")]
+    if let Some(usb) = config.channels.usb.as_ref().filter(|usb| usb.is_enabled()) {
+        drdynvc = drdynvc.with_listener(crate::usb::urbdrc_listener(usb, input_sender.clone()));
     }
 
     // Clone the connector config so we can apply runtime overrides before handing it to the
@@ -3245,6 +3270,20 @@ fn poll_deferred_rdpdr_output(active_stage: &mut ActiveStage) -> SessionResult<O
     }
 }
 
+#[cfg(feature = "usb")]
+fn urbdrc_iteration(
+    active_stage: &mut ActiveStage,
+    event: ironrdp_rdpeusb_native::UrbdrcEvent,
+) -> SessionResult<ActiveSessionIteration> {
+    use crate::usb::UrbdrcOutput;
+
+    Ok(match crate::usb::process_urbdrc_event(active_stage, event)? {
+        UrbdrcOutput::Dvc(batch) => ActiveSessionIteration::dvc(batch),
+        UrbdrcOutput::Frame(frame) => ActiveSessionIteration::outputs(vec![ActiveStageOutput::ResponseFrame(frame)]),
+        UrbdrcOutput::Nothing => ActiveSessionIteration::outputs(Vec::new()),
+    })
+}
+
 #[cfg(feature = "rdpdr")]
 fn process_rdpdr_drive_change(
     active_stage: &mut ActiveStage,
@@ -3441,7 +3480,7 @@ async fn active_session(
             GracefulDisconnectReason::UserInitiated,
         ));
     }
-    #[cfg(not(feature = "clipboard"))]
+    #[cfg(not(any(feature = "clipboard", feature = "usb")))]
     let _ = clipboard_event_receiver;
 
     let disconnect_reason = 'outer: loop {
@@ -3453,11 +3492,11 @@ async fn active_session(
         let video_deadline: Option<tokio::time::Instant> = None;
         let mut malformed_bitmap_redraw_queued = false;
         let clipboard_event = async {
-            #[cfg(feature = "clipboard")]
+            #[cfg(any(feature = "clipboard", feature = "usb"))]
             {
                 clipboard_event_receiver.recv().await
             }
-            #[cfg(not(feature = "clipboard"))]
+            #[cfg(not(any(feature = "clipboard", feature = "usb")))]
             {
                 core::future::pending::<Option<RdpInputEvent>>().await
             }
@@ -3632,14 +3671,21 @@ async fn active_session(
                     }
                 }
                 clipboard_event = clipboard_event => {
-                    #[cfg(feature = "clipboard")]
+                    #[cfg(any(feature = "clipboard", feature = "usb"))]
                     {
-                        let Some(RdpInputEvent::Clipboard(event)) = clipboard_event else {
-                            return Err(ironrdp_session::general_err!("clipboard event channel closed"));
-                        };
-                        ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
+                        match clipboard_event {
+                            #[cfg(feature = "clipboard")]
+                            Some(RdpInputEvent::Clipboard(event)) => {
+                                ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
+                            }
+                            #[cfg(feature = "usb")]
+                            Some(RdpInputEvent::Urbdrc(event)) => urbdrc_iteration(&mut active_stage, event)?,
+                            // Only clipboard and USB events are queued on this channel.
+                            Some(_) => ActiveSessionIteration::outputs(Vec::new()),
+                            None => return Err(ironrdp_session::general_err!("clipboard event channel closed")),
+                        }
                     }
-                    #[cfg(not(feature = "clipboard"))]
+                    #[cfg(not(any(feature = "clipboard", feature = "usb")))]
                     {
                         let _ = clipboard_event;
                         unreachable!("clipboard receive is pending without the clipboard feature")
@@ -3945,6 +3991,8 @@ async fn active_session(
                         };
                         ActiveSessionIteration::outputs(outputs)
                     }
+                    #[cfg(feature = "usb")]
+                    RdpInputEvent::Urbdrc(event) => urbdrc_iteration(&mut active_stage, event)?,
                     }
                 }
                 _ = cleanup_interval.tick() => {

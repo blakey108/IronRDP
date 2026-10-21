@@ -19,4 +19,7 @@ pub mod video;
 #[cfg(all(any(windows, target_os = "linux"), feature = "clipboard"))]
 mod clipboard;
 
+#[cfg(feature = "usb")]
+mod usb;
+
 mod ws;
