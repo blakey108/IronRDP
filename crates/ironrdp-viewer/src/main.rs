@@ -25,6 +25,10 @@ fn main() -> anyhow::Result<()> {
         return run_rpc(cli).context("RPC server");
     }
 
+    if cli.list_usb_devices() {
+        return ironrdp_viewer::cli::print_usb_devices();
+    }
+
     let dump_rdp = cli.dump_rdp().map(ToOwned::to_owned);
     #[cfg(windows)]
     let redirect_printers = cli.redirect_printers();

@@ -2461,14 +2461,11 @@ impl ConfigBuilder {
             self.channels.qoiz = enabled;
         }
 
+        #[cfg(feature = "usb")]
         if let Some(devices) = ps.usb_devices_to_redirect() {
-            #[cfg(feature = "usb")]
-            {
-                let usb = ironrdp_rdpeusb_native::UsbRedirectionConfig::parse_rdp(devices)
-                    .context("invalid usbdevicestoredirect property")?;
-                self.channels.usb = usb.is_enabled().then_some(usb);
-            }
-            let _ = devices;
+            let usb = ironrdp_rdpeusb_native::UsbRedirectionConfig::parse_rdp(devices)
+                .context("invalid usbdevicestoredirect property")?;
+            self.channels.usb = usb.is_enabled().then_some(usb);
         }
 
         #[cfg(feature = "dvc-pipe-proxy")]
