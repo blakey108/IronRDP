@@ -3,8 +3,8 @@
 //! [`TileDecoder`] turns one encoded `TS_RFX_TILE` into 64x64 RGBA pixels (RLGR entropy decoding,
 //! sub-band reconstruction, dequantization, inverse DWT and YCbCr to RGB conversion, [3.1.8]).
 //! [`MessageDecoder`] parses a whole RemoteFX message ([2.2.2]), as carried in an [MS-RDPEGFX]
-//! `RDPGFX_CODECID_CAVIDEO` command, into its region rectangles and still-encoded tiles, so the
-//! caller decodes only the tiles it will draw.
+//! `RDPGFX_CODECID_CAVIDEO` command, into its frames: each region and its still-encoded tiles, so
+//! the caller decodes only the tiles it will draw.
 //!
 //! [MS-RDPRFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/62495a4a-a495-46ea-b459-5cde04c44549
 //! [2.2.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/edd6c368-4f39-420a-bf14-a0e83c654ab7
@@ -46,6 +46,8 @@ pub enum RfxDecodeError {
     InvalidQuantIndex { index: u8, table_len: usize },
     /// The message lacks a block it needs to be rendered.
     MissingBlock(&'static str),
+    /// A frame carries a block it may hold only once, a second time.
+    UnexpectedBlock(&'static str),
     /// A tileset names a different entropy algorithm than the stream's `TS_RFX_CONTEXT`.
     EntropyMismatch {
         context: EntropyAlgorithm,
@@ -65,6 +67,7 @@ impl core::fmt::Display for RfxDecodeError {
                 write!(f, "quant index {index} exceeds table length {table_len}")
             }
             Self::MissingBlock(name) => write!(f, "RemoteFX message missing {name} block"),
+            Self::UnexpectedBlock(name) => write!(f, "RemoteFX frame carries more than one {name} block"),
             Self::EntropyMismatch { context, tileset } => {
                 write!(
                     f,
@@ -89,6 +92,7 @@ impl core::error::Error for RfxDecodeError {
             Self::ColorConversion(e) => Some(e),
             Self::InvalidQuantIndex { .. }
             | Self::MissingBlock(_)
+            | Self::UnexpectedBlock(_)
             | Self::EntropyMismatch { .. }
             | Self::TooManyTiles(_) => None,
         }
@@ -169,21 +173,38 @@ impl TileDecoder {
     }
 }
 
-/// The renderable content of one RemoteFX message, with its tiles still encoded.
+/// One frame of a RemoteFX message: its region and its tileset, with the tiles still encoded.
+#[derive(Debug, Clone)]
+pub struct Frame<'a> {
+    /// Region rectangles relative to the message origin. Only the parts of a tile that fall within
+    /// one of them are valid. Empty when the region carried no rectangle, in which case
+    /// [MS-RDPRFX] [2.2.2.3.3] makes the whole frame valid.
+    ///
+    /// [MS-RDPRFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/62495a4a-a495-46ea-b459-5cde04c44549
+    /// [2.2.2.3.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/23d2a1d6-1be0-4357-83eb-998b66ddd4d9
+    pub rectangles: Vec<RfxRectangle>,
+    /// The tileset, with its quantization tables and entropy algorithm.
+    pub tile_set: TileSetPdu<'a>,
+}
+
+/// The renderable content of one RemoteFX message: every frame it carries, in order.
 #[derive(Debug, Clone, Default)]
 pub struct Message<'a> {
-    /// Region rectangles relative to the message origin. Only the parts of a tile that fall within
-    /// one of them are valid. Empty when the message carried no rectangle.
-    pub rectangles: Vec<RfxRectangle>,
-    /// The tilesets, each with its quantization tables and entropy algorithm.
-    pub tile_sets: Vec<TileSetPdu<'a>>,
+    pub frames: Vec<Frame<'a>>,
 }
 
 impl Message<'_> {
-    /// Total tile count across all tilesets.
+    /// Total tile count across all frames.
     pub fn tile_count(&self) -> usize {
-        self.tile_sets.iter().map(|tile_set| tile_set.tiles.len()).sum()
+        self.frames.iter().map(|frame| frame.tile_set.tiles.len()).sum()
     }
+}
+
+/// The blocks of the frame being parsed, between `TS_RFX_FRAME_BEGIN` and `TS_RFX_FRAME_END`.
+#[derive(Default)]
+struct OpenFrame<'a> {
+    rectangles: Option<Vec<RfxRectangle>>,
+    tile_set: Option<TileSetPdu<'a>>,
 }
 
 /// Parses RemoteFX messages ([MS-RDPRFX] [2.2.2]), as carried in an [MS-RDPEGFX]
@@ -194,8 +215,12 @@ impl Message<'_> {
 /// in every message, so the decoder keeps the entropy algorithm of the last `TS_RFX_CONTEXT` and
 /// rejects a tileset that disagrees with it.
 ///
+/// A message may carry several frames, each bracketed by `TS_RFX_FRAME_BEGIN` and
+/// `TS_RFX_FRAME_END` and holding exactly one region and one tileset ([3.1.8.3.1]).
+///
 /// [MS-RDPRFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/62495a4a-a495-46ea-b459-5cde04c44549
 /// [2.2.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/edd6c368-4f39-420a-bf14-a0e83c654ab7
+/// [3.1.8.3.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/028ed301-385c-4b17-84ec-0a158a22c1b2
 /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
 #[derive(Debug, Clone, Default)]
 pub struct MessageDecoder {
@@ -211,7 +236,7 @@ impl MessageDecoder {
     pub fn parse<'a>(&mut self, data: &'a [u8]) -> Result<Message<'a>, RfxDecodeError> {
         let mut src = ReadCursor::new(data);
         let mut message = Message::default();
-        let mut frame_begun = false;
+        let mut open: Option<OpenFrame<'a>> = None;
         let mut tile_count = 0usize;
 
         while !src.is_empty() {
@@ -219,11 +244,24 @@ impl MessageDecoder {
                 Block::CodecChannel(CodecChannel::Context(context)) => {
                     self.context_entropy = Some(context.entropy_algorithm);
                 }
-                Block::CodecChannel(CodecChannel::FrameBegin(_)) => frame_begun = true,
+                Block::CodecChannel(CodecChannel::FrameBegin(_)) => {
+                    if open.is_some() {
+                        return Err(RfxDecodeError::MissingBlock("FRAME_END"));
+                    }
+                    open = Some(OpenFrame::default());
+                }
                 Block::CodecChannel(CodecChannel::Region(region)) => {
-                    message.rectangles.extend(region.rectangles);
+                    let frame = open.as_mut().ok_or(RfxDecodeError::MissingBlock("FRAME_BEGIN"))?;
+                    if frame.rectangles.is_some() {
+                        return Err(RfxDecodeError::UnexpectedBlock("REGION"));
+                    }
+                    frame.rectangles = Some(region.rectangles);
                 }
                 Block::CodecChannel(CodecChannel::TileSet(tile_set)) => {
+                    let frame = open.as_mut().ok_or(RfxDecodeError::MissingBlock("FRAME_BEGIN"))?;
+                    if frame.tile_set.is_some() {
+                        return Err(RfxDecodeError::UnexpectedBlock("TILESET"));
+                    }
                     if let Some(context) = self.context_entropy {
                         if context != tile_set.entropy_algorithm {
                             return Err(RfxDecodeError::EntropyMismatch {
@@ -233,12 +271,18 @@ impl MessageDecoder {
                         }
                     }
                     tile_count = tile_count.saturating_add(tile_set.tiles.len());
-                    if tile_count > MAX_TILES_PER_MESSAGE {
+                    if MAX_TILES_PER_MESSAGE < tile_count {
                         return Err(RfxDecodeError::TooManyTiles(tile_count));
                     }
-                    message.tile_sets.push(tile_set);
+                    frame.tile_set = Some(tile_set);
                 }
-                Block::CodecChannel(CodecChannel::FrameEnd(_)) => break,
+                Block::CodecChannel(CodecChannel::FrameEnd(_)) => {
+                    let frame = open.take().ok_or(RfxDecodeError::MissingBlock("FRAME_BEGIN"))?;
+                    message.frames.push(Frame {
+                        rectangles: frame.rectangles.ok_or(RfxDecodeError::MissingBlock("REGION"))?,
+                        tile_set: frame.tile_set.ok_or(RfxDecodeError::MissingBlock("TILESET"))?,
+                    });
+                }
                 // Validated by their block decoders; nothing else to take from them.
                 Block::Sync(_) | Block::CodecVersions(_) | Block::Channels(_) => {}
                 // Capability blocks belong to the capability exchange, and a bare tile only
@@ -247,11 +291,11 @@ impl MessageDecoder {
             }
         }
 
-        if !frame_begun {
-            return Err(RfxDecodeError::MissingBlock("FRAME_BEGIN"));
+        if open.is_some() {
+            return Err(RfxDecodeError::MissingBlock("FRAME_END"));
         }
-        if message.tile_sets.is_empty() {
-            return Err(RfxDecodeError::MissingBlock("TILESET"));
+        if message.frames.is_empty() {
+            return Err(RfxDecodeError::MissingBlock("FRAME_BEGIN"));
         }
 
         Ok(message)

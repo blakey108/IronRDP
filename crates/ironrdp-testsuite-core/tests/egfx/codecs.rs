@@ -441,6 +441,49 @@ fn remotefx_decodes_the_ms_rdprfx_sample_into_the_surface() {
 }
 
 #[test]
+fn remotefx_paints_every_frame_of_one_command() {
+    // oracle: spec MS-RDPRFX §3.1.8.3.1 (a stream may carry several frames, each with its own region)
+    // and MS-RDPEGFX §3.3.5.1 (the decoded bitmap is copied to the surface)
+    let mut message = encode_rfx(
+        &solid(64, 64, [200, 30, 30, 255]),
+        64,
+        64,
+        vec![RfxRectangle {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        }],
+        true,
+    );
+    // The second frame covers the right half only, without repeating the headers.
+    message.extend(encode_rfx(
+        &solid(128, 64, [60, 90, 160, 255]),
+        128,
+        64,
+        vec![RfxRectangle {
+            x: 64,
+            y: 0,
+            width: 64,
+            height: 64,
+        }],
+        false,
+    ));
+
+    let (mut client, _) = client_with_surface(128, 64);
+    let output = render_frame(
+        &mut client,
+        128,
+        64,
+        vec![wire(Codec1Type::RemoteFx, rect(0, 0, 128, 64), message)],
+    );
+
+    assert_eq!(client.dropped_updates(), 0);
+    assert_close(pixel(&output, 128, 10, 10), [200, 30, 30, 255]);
+    assert_close(pixel(&output, 128, 100, 50), [60, 90, 160, 255]);
+}
+
+#[test]
 fn remotefx_never_paints_outside_the_destination() {
     // oracle: spec MS-RDPEGFX §2.2.2.1 (destRect bounds the bitmap data)
     const W: u16 = 128;

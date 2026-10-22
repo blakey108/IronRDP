@@ -85,7 +85,7 @@ impl FilePersistentCache {
         let mut offset = FILE_HEADER_SIZE;
         let mut entries = Vec::new();
         for _ in 0..count.min(u32::try_from(MAX_CACHE_IMPORT_ENTRIES).expect("small constant")) {
-            if offset + ENTRY_HEADER_SIZE > file_len {
+            if file_len < offset + ENTRY_HEADER_SIZE {
                 break;
             }
             let cache_key = read_u64(&mut reader)?;
@@ -96,7 +96,7 @@ impl FilePersistentCache {
 
             // A length past the cache's capacity or past the end of the file means corruption;
             // keep the entries read so far.
-            if len == 0 || len > u64::try_from(CACHE_BYTES).expect("fits") || data_offset + len > file_len {
+            if len == 0 || u64::try_from(CACHE_BYTES).expect("fits") < len || file_len < data_offset + len {
                 break;
             }
 

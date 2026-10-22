@@ -1067,6 +1067,13 @@ fn bitmap_cache_persistence_reaches_the_graphics_cache() {
         parse_config_from_rdp(&disabled, &[]).channels().egfx_persistent_cache,
         None
     );
+    // The command line is applied after the .rdp file, so an explicit path still wins.
+    assert_eq!(
+        parse_config_from_rdp(&disabled, &["--egfx-cache", "explicit.bin"])
+            .channels()
+            .egfx_persistent_cache,
+        Some(PathBuf::from("explicit.bin"))
+    );
 }
 
 #[test]

@@ -70,8 +70,9 @@ pub struct CachedBitmap<'a> {
 pub trait PersistentCacheStore: Send {
     /// List the stored entries, the most valuable first.
     ///
-    /// The client offers a prefix of this list: at most [`MAX_CACHE_IMPORT_ENTRIES`], no more
-    /// entries than the confirmed cache has slots, and no more bytes than it holds.
+    /// The client offers the entries that fit, in this order: it skips an entry that would take
+    /// the offer past the confirmed cache's byte capacity and keeps going with the smaller ones,
+    /// and stops at [`MAX_CACHE_IMPORT_ENTRIES`] or at the cache's slot count.
     fn entries(&mut self) -> Result<Vec<CacheEntryMetadata>, PersistentCacheError>;
 
     /// Read the entry stored under `cache_key`, or `None` if it is gone.

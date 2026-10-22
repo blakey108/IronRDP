@@ -1423,10 +1423,12 @@ pub fn egfx_zgfx_decompress(data: &[u8]) {
     let _ = decompressor.decompress(data, &mut output);
 }
 
-/// Panic and sanitizer oracle for the Alpha codec decoder (MS-RDPEGFX 2.2.4.3).
+/// Panic and sanitizer oracle for the Alpha codec decoder ([MS-RDPEGFX 2.2.4.3]).
 ///
 /// The first four bytes choose the bitmap width and height, so the fuzzer can reach runs that
 /// overrun or undershoot the area as well as the extended run-length encodings.
+///
+/// [MS-RDPEGFX 2.2.4.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/4c14f2a6-a025-476f-aa33-30f1718bd015
 pub fn egfx_alpha_decode(data: &[u8]) {
     let [w0, w1, h0, h1, stream @ ..] = data else {
         return;
@@ -1445,8 +1447,10 @@ pub fn egfx_alpha_decode(data: &[u8]) {
     }
 }
 
-/// Panic and sanitizer oracle for the RemoteFX message parser and tile decoder (MS-RDPRFX 2.2.2),
-/// as the EGFX client runs them on `RDPGFX_CODECID_CAVIDEO` payloads.
+/// Panic and sanitizer oracle for the RemoteFX message parser and tile decoder
+/// ([MS-RDPRFX 2.2.2]), as the EGFX client runs them on `RDPGFX_CODECID_CAVIDEO` payloads.
+///
+/// [MS-RDPRFX 2.2.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/edd6c368-4f39-420a-bf14-a0e83c654ab7
 pub fn egfx_rfx_decode(data: &[u8]) {
     use ironrdp_graphics::rfx::{MAX_TILES_PER_MESSAGE, MessageDecoder, TILE_RGBA_LEN, TileDecoder};
 
@@ -1456,7 +1460,8 @@ pub fn egfx_rfx_decode(data: &[u8]) {
     assert!(message.tile_count() <= MAX_TILES_PER_MESSAGE);
 
     let mut tiles = TileDecoder::new();
-    for tile_set in &message.tile_sets {
+    for frame in &message.frames {
+        let tile_set = &frame.tile_set;
         for tile in &tile_set.tiles {
             if let Ok(pixels) = tiles.decode(tile, &tile_set.quants, tile_set.entropy_algorithm) {
                 assert_eq!(pixels.len(), TILE_RGBA_LEN);

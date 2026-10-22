@@ -1,5 +1,5 @@
 use ironrdp_core::{Encode as _, WriteCursor};
-use ironrdp_graphics::rfx::{MAX_TILES_PER_MESSAGE, MessageDecoder, RfxDecodeError, TILE_RGBA_LEN, TileDecoder};
+use ironrdp_graphics::rfx::{MessageDecoder, RfxDecodeError, TILE_RGBA_LEN, TileDecoder};
 use ironrdp_graphics::rfx_encode_component;
 use ironrdp_pdu::codecs::rfx::{
     Block, CodecChannel, ContextPdu, EntropyAlgorithm, FrameBeginPdu, FrameEndPdu, OperatingMode, Quant, RegionPdu,
@@ -37,8 +37,8 @@ fn encode_blocks(blocks: &[Block<'_>]) -> Vec<u8> {
     buffer
 }
 
-fn frame(tile_set: TileSetPdu<'_>, rectangles: Vec<RfxRectangle>) -> Vec<u8> {
-    encode_blocks(&[
+fn frame_blocks<'a>(tile_set: TileSetPdu<'a>, rectangles: Vec<RfxRectangle>) -> [Block<'a>; 4] {
+    [
         Block::CodecChannel(CodecChannel::FrameBegin(FrameBeginPdu {
             index: 7,
             number_of_regions: 1,
@@ -46,7 +46,34 @@ fn frame(tile_set: TileSetPdu<'_>, rectangles: Vec<RfxRectangle>) -> Vec<u8> {
         Block::CodecChannel(CodecChannel::Region(RegionPdu { rectangles })),
         Block::CodecChannel(CodecChannel::TileSet(tile_set)),
         Block::CodecChannel(CodecChannel::FrameEnd(FrameEndPdu)),
-    ])
+    ]
+}
+
+fn frame(tile_set: TileSetPdu<'_>, rectangles: Vec<RfxRectangle>) -> Vec<u8> {
+    encode_blocks(&frame_blocks(tile_set, rectangles))
+}
+
+fn begin() -> Block<'static> {
+    Block::CodecChannel(CodecChannel::FrameBegin(FrameBeginPdu {
+        index: 0,
+        number_of_regions: 1,
+    }))
+}
+
+fn region() -> Block<'static> {
+    Block::CodecChannel(CodecChannel::Region(RegionPdu { rectangles: vec![] }))
+}
+
+fn end() -> Block<'static> {
+    Block::CodecChannel(CodecChannel::FrameEnd(FrameEndPdu))
+}
+
+fn empty_tile_set() -> Block<'static> {
+    Block::CodecChannel(CodecChannel::TileSet(TileSetPdu {
+        entropy_algorithm: EntropyAlgorithm::Rlgr3,
+        quants: vec![Quant::default()],
+        tiles: vec![],
+    }))
 }
 
 #[test]
@@ -114,10 +141,65 @@ fn a_message_without_headers_parses_its_rectangles_and_tiles() {
 
     let message = MessageDecoder::new().parse(&stream).unwrap();
 
-    assert_eq!(message.rectangles, rectangles);
+    assert_eq!(message.frames.len(), 1);
+    assert_eq!(message.frames[0].rectangles, rectangles);
     assert_eq!(message.tile_count(), 2);
-    let positions: Vec<_> = message.tile_sets[0].tiles.iter().map(|tile| (tile.x, tile.y)).collect();
+    let positions: Vec<_> = message.frames[0]
+        .tile_set
+        .tiles
+        .iter()
+        .map(|tile| (tile.x, tile.y))
+        .collect();
     assert_eq!(positions, [(0, 0), (1, 1)]);
+}
+
+#[test]
+fn every_frame_of_a_message_is_parsed_with_its_own_region() {
+    // oracle: spec MS-RDPRFX §3.1.8.3.1 (a stream carries frames, each bracketed by FRAME_BEGIN and
+    // FRAME_END with one region and one tileset)
+    let quant = Quant::default();
+    let zero = flat_component(0, &quant, EntropyAlgorithm::Rlgr3);
+    let first = vec![RfxRectangle {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 8,
+    }];
+    let second = vec![RfxRectangle {
+        x: 64,
+        y: 0,
+        width: 4,
+        height: 4,
+    }];
+    let mut blocks = frame_blocks(
+        TileSetPdu {
+            entropy_algorithm: EntropyAlgorithm::Rlgr3,
+            quants: vec![quant.clone()],
+            tiles: vec![tile(0, 0, &zero)],
+        },
+        first.clone(),
+    )
+    .to_vec();
+    blocks.extend(frame_blocks(
+        TileSetPdu {
+            entropy_algorithm: EntropyAlgorithm::Rlgr3,
+            quants: vec![quant],
+            tiles: vec![tile(1, 0, &zero)],
+        },
+        second.clone(),
+    ));
+
+    let stream = encode_blocks(&blocks);
+    let message = MessageDecoder::new().parse(&stream).unwrap();
+
+    let rectangles: Vec<_> = message.frames.iter().map(|frame| frame.rectangles.clone()).collect();
+    assert_eq!(rectangles, [first, second]);
+    let tiles: Vec<_> = message
+        .frames
+        .iter()
+        .map(|frame| (frame.tile_set.tiles[0].x, frame.tile_set.tiles[0].y))
+        .collect();
+    assert_eq!(tiles, [(0, 0), (1, 0)]);
 }
 
 #[test]
@@ -132,15 +214,10 @@ fn a_tileset_disagreeing_with_the_context_entropy_is_rejected() {
             flags: OperatingMode::IMAGE_MODE,
             entropy_algorithm: EntropyAlgorithm::Rlgr3,
         })),
-        Block::CodecChannel(CodecChannel::FrameBegin(FrameBeginPdu {
-            index: 0,
-            number_of_regions: 1,
-        })),
-        Block::CodecChannel(CodecChannel::TileSet(TileSetPdu {
-            entropy_algorithm: EntropyAlgorithm::Rlgr3,
-            quants: vec![quant.clone()],
-            tiles: vec![],
-        })),
+        begin(),
+        region(),
+        empty_tile_set(),
+        end(),
     ]);
     decoder.parse(&context).unwrap();
 
@@ -169,7 +246,7 @@ fn a_tileset_disagreeing_with_the_context_entropy_is_rejected() {
 
 #[test]
 fn a_message_with_more_tiles_than_any_display_needs_is_rejected_before_decoding() {
-    // oracle: input chosen by the test (one tile past the documented 16,384-tile limit)
+    // oracle: mutant (a message past the tile limit decoded instead of rejected)
     let quant = Quant::default();
     let zero = flat_component(0, &quant, EntropyAlgorithm::Rlgr3);
     let tiles: Vec<_> = (0..16_385u32)
@@ -186,20 +263,13 @@ fn a_message_with_more_tiles_than_any_display_needs_is_rejected_before_decoding(
 
     let error = MessageDecoder::new().parse(&stream).unwrap_err();
 
-    assert_eq!(MAX_TILES_PER_MESSAGE, 16_384);
     assert!(matches!(error, RfxDecodeError::TooManyTiles(16_385)), "{error:?}");
 }
 
 #[test]
-fn a_message_without_a_tileset_is_rejected() {
-    // oracle: spec MS-RDPRFX §3.1.8.3.1 (a frame carries a region and a tileset)
-    let stream = encode_blocks(&[
-        Block::CodecChannel(CodecChannel::FrameBegin(FrameBeginPdu {
-            index: 0,
-            number_of_regions: 1,
-        })),
-        Block::CodecChannel(CodecChannel::FrameEnd(FrameEndPdu)),
-    ]);
+fn a_frame_without_a_tileset_is_rejected() {
+    // oracle: spec MS-RDPRFX §3.1.8.3.1 (one TS_RFX_TILESET per TS_RFX_REGION)
+    let stream = encode_blocks(&[begin(), region(), end()]);
 
     let error = MessageDecoder::new().parse(&stream).unwrap_err();
 
@@ -207,9 +277,39 @@ fn a_message_without_a_tileset_is_rejected() {
 }
 
 #[test]
+fn a_frame_without_a_region_is_rejected() {
+    // oracle: spec MS-RDPRFX §3.1.8.3.1 (one TS_RFX_REGION per frame)
+    let stream = encode_blocks(&[begin(), empty_tile_set(), end()]);
+
+    let error = MessageDecoder::new().parse(&stream).unwrap_err();
+
+    assert!(matches!(error, RfxDecodeError::MissingBlock("REGION")), "{error:?}");
+}
+
+#[test]
+fn a_frame_with_two_regions_is_rejected() {
+    // oracle: spec MS-RDPRFX §3.1.8.3.1 (there MUST only be one TS_RFX_REGION per frame)
+    let stream = encode_blocks(&[begin(), region(), region(), empty_tile_set(), end()]);
+
+    let error = MessageDecoder::new().parse(&stream).unwrap_err();
+
+    assert!(matches!(error, RfxDecodeError::UnexpectedBlock("REGION")), "{error:?}");
+}
+
+#[test]
+fn a_frame_without_a_frame_end_is_rejected() {
+    // oracle: spec MS-RDPRFX §3.1.8.3.1 (frame data is bracketed by FRAME_BEGIN and FRAME_END)
+    let stream = encode_blocks(&[begin(), region(), empty_tile_set()]);
+
+    let error = MessageDecoder::new().parse(&stream).unwrap_err();
+
+    assert!(matches!(error, RfxDecodeError::MissingBlock("FRAME_END")), "{error:?}");
+}
+
+#[test]
 fn a_message_without_a_frame_begin_is_rejected() {
     // oracle: spec MS-RDPRFX §3.1.8.3.1 (data messages start with TS_RFX_FRAME_BEGIN)
-    let stream = encode_blocks(&[Block::CodecChannel(CodecChannel::FrameEnd(FrameEndPdu))]);
+    let stream = encode_blocks(&[end()]);
 
     let error = MessageDecoder::new().parse(&stream).unwrap_err();
 

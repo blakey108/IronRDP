@@ -133,6 +133,10 @@ pub struct CodecCapabilities {
     pub avc420: bool,
     /// AVC444 (H.264 4:4:4) is available
     pub avc444: bool,
+    /// Small cache mode
+    pub small_cache: bool,
+    /// Thin client mode
+    pub thin_client: bool,
     /// The bitmap cache is limited to 16 MB and 4096 slots ([MS-RDPEGFX] [3.3.1.4]).
     ///
     /// That is the case with `SMALL_CACHE`, with the version 8 and 8.1 `THINCLIENT` flag, and
@@ -141,9 +145,7 @@ pub struct CodecCapabilities {
     ///
     /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
     /// [3.3.1.4]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/d1c1540f-9bc7-4344-81e0-3cce6b845f86
-    pub small_cache: bool,
-    /// Thin client mode
-    pub thin_client: bool,
+    pub small_bitmap_cache: bool,
 }
 
 impl CodecCapabilities {
@@ -153,32 +155,39 @@ impl CodecCapabilities {
             CapabilitySet::V8 { flags } => Self {
                 avc420: false,
                 avc444: false,
-                small_cache: flags.intersects(CapabilitiesV8Flags::SMALL_CACHE | CapabilitiesV8Flags::THIN_CLIENT),
+                small_cache: flags.contains(CapabilitiesV8Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV8Flags::THIN_CLIENT),
+                small_bitmap_cache: flags
+                    .intersects(CapabilitiesV8Flags::SMALL_CACHE | CapabilitiesV8Flags::THIN_CLIENT),
             },
             CapabilitySet::V8_1 { flags } => Self {
                 avc420: flags.contains(CapabilitiesV81Flags::AVC420_ENABLED),
                 avc444: false,
-                small_cache: flags.intersects(CapabilitiesV81Flags::SMALL_CACHE | CapabilitiesV81Flags::THIN_CLIENT),
+                small_cache: flags.contains(CapabilitiesV81Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV81Flags::THIN_CLIENT),
+                small_bitmap_cache: flags
+                    .intersects(CapabilitiesV81Flags::SMALL_CACHE | CapabilitiesV81Flags::THIN_CLIENT),
             },
             CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => Self {
                 avc420: !flags.contains(crate::pdu::CapabilitiesV10Flags::AVC_DISABLED),
                 avc444: !flags.contains(crate::pdu::CapabilitiesV10Flags::AVC_DISABLED),
                 small_cache: flags.contains(crate::pdu::CapabilitiesV10Flags::SMALL_CACHE),
                 thin_client: false,
+                small_bitmap_cache: flags.contains(crate::pdu::CapabilitiesV10Flags::SMALL_CACHE),
             },
             CapabilitySet::V10_1 => Self {
                 avc420: true,
                 avc444: true,
                 small_cache: false,
                 thin_client: false,
+                small_bitmap_cache: false,
             },
             CapabilitySet::V10_3 { flags } => Self {
                 avc420: !flags.contains(crate::pdu::CapabilitiesV103Flags::AVC_DISABLED),
                 avc444: !flags.contains(crate::pdu::CapabilitiesV103Flags::AVC_DISABLED),
-                small_cache: true,
+                small_cache: false,
                 thin_client: flags.contains(crate::pdu::CapabilitiesV103Flags::AVC_THIN_CLIENT),
+                small_bitmap_cache: true,
             },
             CapabilitySet::V10_4 { flags }
             | CapabilitySet::V10_5 { flags }
@@ -188,12 +197,14 @@ impl CodecCapabilities {
                 avc444: !flags.contains(crate::pdu::CapabilitiesV104Flags::AVC_DISABLED),
                 small_cache: flags.contains(crate::pdu::CapabilitiesV104Flags::SMALL_CACHE),
                 thin_client: flags.contains(crate::pdu::CapabilitiesV104Flags::AVC_THIN_CLIENT),
+                small_bitmap_cache: flags.contains(crate::pdu::CapabilitiesV104Flags::SMALL_CACHE),
             },
             CapabilitySet::V10_7 { flags } => Self {
                 avc420: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
                 avc444: !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
                 small_cache: flags.contains(CapabilitiesV107Flags::SMALL_CACHE),
                 thin_client: flags.contains(CapabilitiesV107Flags::AVC_THIN_CLIENT),
+                small_bitmap_cache: flags.contains(CapabilitiesV107Flags::SMALL_CACHE),
             },
         }
     }
@@ -1265,41 +1276,58 @@ impl GraphicsPipelineClient {
         let clip = |left: u32, top: u32, width: u32, height: u32| {
             let right = left.saturating_add(width).min(bound_right);
             let bottom = top.saturating_add(height).min(bound_bottom);
+            // INVARIANT: `left < right <= bound_right` and `top < bottom <= bound_bottom`, and both
+            // bounds are `u16` values, so every edge fits a `u16`.
             (left < right && top < bottom).then(|| ExclusiveRectangle {
-                left: u16::try_from(left).unwrap_or(u16::MAX),
-                top: u16::try_from(top).unwrap_or(u16::MAX),
-                right: u16::try_from(right).unwrap_or(u16::MAX),
-                bottom: u16::try_from(bottom).unwrap_or(u16::MAX),
+                left: u16::try_from(left).expect("left < right fits u16"),
+                top: u16::try_from(top).expect("top < bottom fits u16"),
+                right: u16::try_from(right).expect("right is at most a u16 bound"),
+                bottom: u16::try_from(bottom).expect("bottom is at most a u16 bound"),
             })
         };
 
         let origin_x = u32::from(dest_rect.left);
         let origin_y = u32::from(dest_rect.top);
-        let region: Vec<ExclusiveRectangle> = if message.rectangles.is_empty() {
-            clip(origin_x, origin_y, u32::MAX, u32::MAX).into_iter().collect()
-        } else {
-            message
-                .rectangles
-                .iter()
-                .filter_map(|r| {
-                    clip(
-                        origin_x + u32::from(r.x),
-                        origin_y + u32::from(r.y),
-                        u32::from(r.width),
-                        u32::from(r.height),
-                    )
-                })
-                .collect()
-        };
+        let regions: Vec<Vec<ExclusiveRectangle>> = message
+            .frames
+            .iter()
+            .map(|frame| {
+                if frame.rectangles.is_empty() {
+                    // A region without rectangles makes the whole frame valid (MS-RDPRFX 2.2.2.3.3);
+                    // in EGFX the frame is the destination.
+                    clip(origin_x, origin_y, u32::MAX, u32::MAX).into_iter().collect()
+                } else {
+                    frame
+                        .rectangles
+                        .iter()
+                        .filter_map(|r| {
+                            clip(
+                                origin_x + u32::from(r.x),
+                                origin_y + u32::from(r.y),
+                                u32::from(r.width),
+                                u32::from(r.height),
+                            )
+                        })
+                        .collect()
+                }
+            })
+            .collect();
 
-        // Each tile is intersected with every rectangle and a message may carry 65,535
+        // Each tile is intersected with every rectangle of its frame and a region may carry 65,535
         // rectangles, so bound the pairs before decoding anything.
-        if message.tile_count().saturating_mul(region.len()) > MAX_RFX_CLIPPING_WORK {
+        let work = message
+            .frames
+            .iter()
+            .zip(&regions)
+            .map(|(frame, region)| frame.tile_set.tiles.len().saturating_mul(region.len()))
+            .fold(0usize, usize::saturating_add);
+        if MAX_RFX_CLIPPING_WORK < work {
             return Err(pdu_other_err!("RemoteFX message has too many tile and rectangle pairs"));
         }
 
         let tile_size = u32::from(rfx::TILE_SIZE);
-        for tile_set in &message.tile_sets {
+        for (frame, region) in message.frames.iter().zip(&regions) {
+            let tile_set = &frame.tile_set;
             for tile in &tile_set.tiles {
                 let tile_left = origin_x + u32::from(tile.x) * tile_size;
                 let tile_top = origin_y + u32::from(tile.y) * tile_size;
@@ -1331,13 +1359,17 @@ impl GraphicsPipelineClient {
                     .map_err(|e| pdu_other_err!("RemoteFX tile decode", source: e))?;
 
                 for destination_rectangle in visible {
-                    // INVARIANT: `destination_rectangle` lies within the tile, so its edges are at
-                    // least `tile_left` and `tile_top` and the subtractions cannot underflow.
+                    // INVARIANT: `destination_rectangle` lies within the 64x64 tile, so each edge is
+                    // at least the tile origin and at most 64 past it: the subtractions cannot
+                    // underflow and the results fit a `u16`.
+                    let local_edge = |edge: u16, origin: u32| {
+                        u16::try_from(u32::from(edge) - origin).expect("tile-local edge is at most 64")
+                    };
                     let local = ExclusiveRectangle {
-                        left: u16::try_from(u32::from(destination_rectangle.left) - tile_left).unwrap_or(u16::MAX),
-                        top: u16::try_from(u32::from(destination_rectangle.top) - tile_top).unwrap_or(u16::MAX),
-                        right: u16::try_from(u32::from(destination_rectangle.right) - tile_left).unwrap_or(u16::MAX),
-                        bottom: u16::try_from(u32::from(destination_rectangle.bottom) - tile_top).unwrap_or(u16::MAX),
+                        left: local_edge(destination_rectangle.left, tile_left),
+                        top: local_edge(destination_rectangle.top, tile_top),
+                        right: local_edge(destination_rectangle.right, tile_left),
+                        bottom: local_edge(destination_rectangle.bottom, tile_top),
                     };
                     let update = BitmapUpdate {
                         surface_id,
@@ -1364,11 +1396,16 @@ impl GraphicsPipelineClient {
     /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
     /// [3.3.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/3fdfcd8d-ec4f-4b7a-8e0d-0385a840ec81
     fn decode_alpha(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
-        self.compositor
+        let composited = self
+            .compositor
             .apply_alpha(surface_id, dest_rect, bitmap_data)
             .map_err(|e| pdu_other_err!("Alpha decode", source: e))?;
 
-        if let Some((destination_rectangle, data)) = self.compositor.read_region(surface_id, dest_rect) {
+        // The handler receives the whole clipped destination after every Alpha command,
+        // a surface-sized copy for a full-surface command. Handlers compose `BitmapUpdate`s as
+        // complete RGBA pixels, which an alpha-only update would break; if that cost matters,
+        // change the handler contract rather than shrinking this update.
+        if let Some((destination_rectangle, data)) = composited {
             let update = BitmapUpdate {
                 surface_id,
                 width: destination_rectangle.right - destination_rectangle.left,
@@ -1452,7 +1489,7 @@ impl GraphicsPipelineClient {
         let Some(store) = self.persistent_cache.as_mut() else {
             return;
         };
-        if pdu.cache_slots.len() > offered.len() {
+        if offered.len() < pdu.cache_slots.len() {
             warn!(
                 offered = offered.len(),
                 imported = pdu.cache_slots.len(),
@@ -1466,7 +1503,7 @@ impl GraphicsPipelineClient {
         let mut invalid_slots = 0usize;
         for (&cache_key, &cache_slot) in offered.iter().zip(&pdu.cache_slots) {
             // Cache slots are one-based (3.3.1.4).
-            if cache_slot == 0 || cache_slot > max_slots {
+            if !(1..=max_slots).contains(&cache_slot) {
                 invalid_slots += 1;
                 continue;
             }
@@ -1663,7 +1700,7 @@ impl DvcClientProcessor for GraphicsPipelineClient {}
 
 /// Cache slot count and byte capacity of the bitmap cache under the confirmed capabilities.
 fn bitmap_cache_limits(caps: &CodecCapabilities) -> (u16, usize) {
-    if caps.small_cache {
+    if caps.small_bitmap_cache {
         (SMALL_CACHE_SLOTS, SMALL_CACHE_BYTES)
     } else {
         (CACHE_SLOTS, CACHE_BYTES)

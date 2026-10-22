@@ -343,60 +343,47 @@ impl Compositor {
     ///
     /// Runs are written straight into the surface, clipped to it, so a stream describing far
     /// more pixels than the surface holds costs no allocation.
+    ///
+    /// Returns the destination clipped to the surface with its RGBA pixels after the update, or
+    /// `None` when the surface does not exist or the destination lies outside it.
     pub(crate) fn apply_alpha(
         &mut self,
         surface_id: u16,
         dest: &ExclusiveRectangle,
         stream: &[u8],
-    ) -> Result<(), AlphaDecodeError> {
+    ) -> Result<Option<(ExclusiveRectangle, Vec<u8>)>, AlphaDecodeError> {
         let x = dest.left;
         let y = dest.top;
         let w = dest.right.saturating_sub(dest.left);
         let h = dest.bottom.saturating_sub(dest.top);
 
-        match self.surfaces.get_mut(&surface_id) {
-            Some(surface) => {
-                let mut canvas = surface.canvas_mut();
-                alpha::decode(stream, w, h, |first_pixel, run| {
-                    write_alpha_run(&mut canvas, (x, y, w), first_pixel, run);
-                })?;
-            }
+        let Some(surface) = self.surfaces.get_mut(&surface_id) else {
             // Validate anyway, so a malformed command is reported the same either way.
-            None => alpha::decode(stream, w, h, |_, _| {})?,
-        }
+            alpha::decode(stream, w, h, |_, _| {})?;
+            return Ok(None);
+        };
+        let mut canvas = surface.canvas_mut();
+        alpha::decode(stream, w, h, |first_pixel, run| {
+            write_alpha_run(&mut canvas, (x, y, w), first_pixel, run);
+        })?;
+
+        let right = dest.right.min(surface.width);
+        let bottom = dest.bottom.min(surface.height);
+        let composited = (x < right && y < bottom).then(|| {
+            let data = copy_region(&surface.data, surface.width, x, y, right - x, bottom - y);
+            (
+                ExclusiveRectangle {
+                    left: x,
+                    top: y,
+                    right,
+                    bottom,
+                },
+                data,
+            )
+        });
 
         self.record_dirty(surface_id, x, y, w, h);
-        Ok(())
-    }
-
-    /// Copy a surface sub-rectangle out, clipped to the surface. `None` if the surface does not
-    /// exist or the rectangle lies outside it.
-    pub(crate) fn read_region(
-        &self,
-        surface_id: u16,
-        rect: &ExclusiveRectangle,
-    ) -> Option<(ExclusiveRectangle, Vec<u8>)> {
-        let surface = self.surfaces.get(&surface_id)?;
-        let right = rect.right.min(surface.width);
-        let bottom = rect.bottom.min(surface.height);
-        if rect.left >= right || rect.top >= bottom {
-            return None;
-        }
-        let clipped = ExclusiveRectangle {
-            left: rect.left,
-            top: rect.top,
-            right,
-            bottom,
-        };
-        let data = copy_region(
-            &surface.data,
-            surface.width,
-            clipped.left,
-            clipped.top,
-            right - clipped.left,
-            bottom - clipped.top,
-        );
-        Some((clipped, data))
+        Ok(composited)
     }
 
     /// Fill each rectangle of a surface with a solid, opaque color (`SolidFill`).
@@ -485,18 +472,11 @@ impl Compositor {
 
         let len = usize::from(w) * usize::from(h) * BYTES_PER_PIXEL;
 
-        // Release first, for the same reason as `create_surface`: `BTreeMap::insert`
-        // drops whatever occupied the slot, so caching repeatedly into one slot must
-        // not accumulate charge.
-        if let Some(previous) = self.cache.remove(&cache_slot) {
-            self.release(previous.data.len());
-        }
-
         // Charged before `copy_region`, not around the insert: the copy is the
         // allocation, so checking afterwards would still let a peer drive the
         // transient the budget exists to prevent. The cache shares the surfaces'
         // budget because both draw on the same process memory.
-        if !self.charge(len) {
+        if !self.claim_slot(cache_slot, len) {
             return;
         }
 
@@ -509,17 +489,7 @@ impl Compositor {
         };
 
         let data = copy_region(&surface.data, surface.width, src_rect.left, src_rect.top, w, h);
-        let last_used = self.tick();
-        self.cache.insert(
-            cache_slot,
-            CachedTile {
-                cache_key,
-                width: w,
-                height: h,
-                data,
-                last_used,
-            },
-        );
+        self.fill_slot(cache_slot, cache_key, w, h, data);
     }
 
     /// Store a tile read back from the persistent cache into a slot the server assigned it in
@@ -537,12 +507,25 @@ impl Compositor {
             return false;
         }
 
-        // Whatever the slot held is replaced, as with `SurfaceToCache`.
-        self.evict_cache_entry(cache_slot);
-        if !self.charge(data.len()) {
+        if !self.claim_slot(cache_slot, data.len()) {
             return false;
         }
+        self.fill_slot(cache_slot, cache_key, width, height, data);
+        true
+    }
 
+    /// Empty a cache slot and charge `len` bytes for its new tile, or refuse if the budget cannot
+    /// hold them, leaving the slot empty.
+    ///
+    /// The slot is released first, for the same reason as `create_surface`: `BTreeMap::insert`
+    /// drops whatever occupied it, so caching repeatedly into one slot must not accumulate charge.
+    fn claim_slot(&mut self, cache_slot: u16, len: usize) -> bool {
+        self.evict_cache_entry(cache_slot);
+        self.charge(len)
+    }
+
+    /// Store a tile in a slot claimed with [`Self::claim_slot`], as the most recently used.
+    fn fill_slot(&mut self, cache_slot: u16, cache_key: u64, width: u16, height: u16, data: Vec<u8>) {
         let last_used = self.tick();
         self.cache.insert(
             cache_slot,
@@ -554,7 +537,6 @@ impl Compositor {
                 last_used,
             },
         );
-        true
     }
 
     /// Every cached tile, most recently used first, for saving to the persistent cache.
@@ -891,7 +873,7 @@ fn write_alpha_run(dst: &mut CanvasMut<'_>, (x, y, w): (u16, u16, u16), first_pi
         let row = pixel / width;
         let col = pixel % width;
         // Rows only grow, so once one falls below the canvas the rest of the run does too.
-        if row >= visible_rows {
+        if visible_rows <= row {
             break;
         }
         let count = (width - col).min(len - offset);

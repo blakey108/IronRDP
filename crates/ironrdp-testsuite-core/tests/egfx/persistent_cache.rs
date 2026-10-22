@@ -235,7 +235,8 @@ fn no_offer_without_a_store() {
 
 #[test]
 fn no_offer_from_an_empty_store() {
-    // oracle: spec MS-RDPEGFX §3.3.5.16 (the offer enumerates the persistent cache)
+    // oracle: reference awakecoding/FreeRDP@16a7c2ec2fd0:channels/rdpgfx/client/rdpgfx_main.c
+    // rdpgfx_send_cache_offer (no offer is sent for an empty cache)
     let mut client = GraphicsPipelineClient::new(Box::new(NoopHandler), None)
         .with_persistent_cache(Box::new(MemoryStore::default()));
     assert!(confirm(&mut client, full_cache_caps()).is_empty());
@@ -366,7 +367,8 @@ fn version_10_3_limits_the_offer_to_the_small_cache_whatever_its_flags() {
 
 #[test]
 fn duplicate_and_empty_entries_are_not_offered() {
-    // oracle: spec MS-RDPEGFX §2.2.2.16.1 (cacheKey uniquely identifies an entry)
+    // oracle: spec MS-RDPEGFX §2.2.2.16.1 (cacheKey is a unique key) for the repeated key 1;
+    // mutant (an entry with no pixels offered) for key 2
     let entries = vec![
         CacheEntryMetadata {
             cache_key: 1,
@@ -441,7 +443,7 @@ fn a_reply_without_an_offer_is_ignored() {
 
 #[test]
 fn a_second_reply_to_one_offer_is_ignored() {
-    // oracle: spec MS-RDPEGFX §3.2.5.16 (one reply answers each offer)
+    // oracle: mutant (a repeated reply reloading the cache from the store)
     let store = MemoryStore::with_entries(vec![solid_entry(100, 4, 4, [255, 0, 0, 255])]);
     let mut client =
         GraphicsPipelineClient::new(Box::new(NoopHandler), None).with_persistent_cache(Box::new(store.clone()));

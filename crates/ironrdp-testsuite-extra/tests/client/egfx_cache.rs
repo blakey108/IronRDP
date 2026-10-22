@@ -164,6 +164,31 @@ fn a_truncated_file_keeps_the_entries_before_the_cut() {
 }
 
 #[test]
+fn a_failed_save_leaves_no_temporary_behind() {
+    // oracle: mutant (a failed save that leaves its temporary file next to the cache)
+    let dir = TempDir::new();
+    let target = dir.file();
+    // A non-empty directory where the cache file should be makes the final rename fail.
+    fs::create_dir_all(target.join("occupied")).unwrap();
+    let data = pixels(2, 2, 1);
+
+    let result = FilePersistentCache::new(&target).save(&[CachedBitmap {
+        cache_key: 1,
+        width: 2,
+        height: 2,
+        data: &data,
+    }]);
+
+    assert!(result.is_err());
+    let leftovers: Vec<_> = fs::read_dir(target.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| Some(name.as_os_str()) != target.file_name())
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
 fn a_foreign_file_is_an_error_not_a_cache() {
     // oracle: mutant (a file without the magic read as a cache)
     let dir = TempDir::new();
