@@ -3544,6 +3544,7 @@ dependencies = [
  "ironrdp-vmconnect",
  "png",
  "rcgen",
+ "rstest",
  "semver",
  "tokio",
  "tokio-rustls",
