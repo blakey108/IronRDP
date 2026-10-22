@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 
 use ironrdp_connector::credssp::{CredsspProcessGenerator, CredsspSequence, KerberosConfig};
+use ironrdp_connector::rdsaad::RdsAadSequence;
 use ironrdp_connector::sspi::credssp::ClientState;
 use ironrdp_connector::sspi::generator::GeneratorState;
 use ironrdp_connector::sspi::network_client::NetworkClient;
@@ -66,6 +67,10 @@ where
     let mut buf = WriteBuf::new();
 
     debug!("CredSSP procedure");
+
+    if connector.should_perform_rdsaad() {
+        perform_rdsaad_step(&mut connector, framed, &mut buf)?;
+    }
 
     if connector.should_perform_credssp() {
         perform_credssp_step(
@@ -134,6 +139,57 @@ fn resolve_generator(
 }
 
 #[instrument(level = "trace", skip_all)]
+fn perform_rdsaad_step<S>(
+    connector: &mut ClientConnector,
+    framed: &mut Framed<S>,
+    buf: &mut WriteBuf,
+) -> ConnectorResult<()>
+where
+    S: Read + Write,
+{
+    assert!(connector.should_perform_rdsaad());
+
+    let ironrdp_connector::Credentials::RdsAad(credentials) = &connector.config.credentials else {
+        return Err(general_err!("RDS AAD Auth was negotiated without RDS AAD credentials"));
+    };
+
+    let unix_time_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+
+    let mut sequence = RdsAadSequence::init(credentials.clone(), unix_time_secs)?;
+
+    // The server sends the first PDU, so each round reads before it writes.
+    while let Some(next_pdu_hint) = sequence.next_pdu_hint() {
+        debug!(
+            connector.state = connector.state.name(),
+            hint = ?next_pdu_hint,
+            "Wait for PDU"
+        );
+
+        let pdu = framed
+            .read_by_hint(next_pdu_hint)
+            .map_err(|e| ironrdp_connector::custom_err!("read frame by hint", e))?;
+
+        trace!(length = pdu.len(), "PDU received");
+
+        buf.clear();
+        let written = sequence.step(&pdu, buf)?;
+
+        if let Some(response_len) = written.size() {
+            let response = &buf[..response_len];
+            trace!(response_len, "Send response");
+            framed
+                .write_all(response)
+                .map_err(|e| ironrdp_connector::custom_err!("write all", e))?;
+        }
+    }
+
+    connector.mark_rdsaad_as_done();
+
+    Ok(())
+}
+
 fn perform_credssp_step<S>(
     connector: &mut ClientConnector,
     framed: &mut Framed<S>,

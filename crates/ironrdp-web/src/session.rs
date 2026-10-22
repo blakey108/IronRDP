@@ -75,6 +75,12 @@ struct SessionBuilderInner {
     client_name: String,
     desktop_size: DesktopSize,
 
+    // Setting any of these selects RDS AAD Auth; all of them are then required.
+    rdsaad_access_token: Option<String>,
+    rdsaad_nonce: Option<String>,
+    rdsaad_pop_key: Option<String>,
+    rdsaad_hostname: Option<String>,
+
     render_canvas: Option<HtmlCanvasElement>,
     set_cursor_style_callback: Option<js_sys::Function>,
     set_cursor_style_callback_context: Option<JsValue>,
@@ -122,6 +128,11 @@ impl Default for SessionBuilderInner {
                 width: DEFAULT_WIDTH,
                 height: DEFAULT_HEIGHT,
             },
+
+            rdsaad_access_token: None,
+            rdsaad_nonce: None,
+            rdsaad_pop_key: None,
+            rdsaad_hostname: None,
 
             render_canvas: None,
             set_cursor_style_callback: None,
@@ -291,6 +302,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |pcb: String| { self.0.borrow_mut().pcb = Some(pcb) };
             |vmconnect: String| { self.0.borrow_mut().vmconnect = Some(vmconnect) };
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
+            |rdsaad_access_token: String| { self.0.borrow_mut().rdsaad_access_token = Some(rdsaad_access_token) };
+            |rdsaad_nonce: String| { self.0.borrow_mut().rdsaad_nonce = Some(rdsaad_nonce) };
+            |rdsaad_pop_key: String| { self.0.borrow_mut().rdsaad_pop_key = Some(rdsaad_pop_key) };
+            |rdsaad_hostname: String| { self.0.borrow_mut().rdsaad_hostname = Some(rdsaad_hostname) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |enable_standard_rdp_security: bool| {
@@ -407,6 +422,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             outbound_message_size_limit,
             legacy_graphics,
             security,
+            rdsaad,
         );
 
         {
@@ -416,7 +432,13 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             username = inner.username.clone().context("username missing")?;
             destination = inner.destination.clone().context("destination missing")?;
             server_domain = inner.server_domain.clone();
-            password = inner.password.clone().context("password missing")?;
+            rdsaad = rdsaad_credentials(&inner, &username)?;
+            // The access token replaces the password.
+            password = if rdsaad.is_some() {
+                inner.password.clone().unwrap_or_default()
+            } else {
+                inner.password.clone().context("password missing")?
+            };
             proxy_address = inner.proxy_address.clone().context("proxy_address missing")?;
             auth_token = inner.auth_token.clone().context("auth_token missing")?;
             pcb = inner.pcb.clone();
@@ -465,6 +487,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             return Err(anyhow::Error::msg("standard RDP security and VMConnect are mutually exclusive").into());
         }
 
+        if rdsaad.is_some() && (security.enable_standard_rdp_security || vmconnect.is_some()) {
+            return Err(anyhow::Error::msg("RDS AAD Auth requires TLS and is not supported with VMConnect").into());
+        }
+
         info!("Connect to RDP host");
 
         let mut config = build_config(
@@ -475,6 +501,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             desktop_size,
             legacy_graphics,
             security,
+            rdsaad,
         );
 
         let enable_server_pointer = self.0.borrow().enable_server_pointer;
@@ -1509,6 +1536,43 @@ fn parse_file_metadata_array(files: JsValue) -> Result<Vec<FileMetadata>, IronEr
     Ok(file_list)
 }
 
+/// Collects the RDS AAD Auth parameters, or `None` when none of them is set.
+fn rdsaad_credentials(
+    inner: &SessionBuilderInner,
+    username: &str,
+) -> Result<Option<connector::rdsaad::RdsAadCredentials>, IronError> {
+    let fields = [
+        ("rdsaad_access_token", &inner.rdsaad_access_token),
+        ("rdsaad_nonce", &inner.rdsaad_nonce),
+        ("rdsaad_pop_key", &inner.rdsaad_pop_key),
+        ("rdsaad_hostname", &inner.rdsaad_hostname),
+    ];
+
+    if fields.iter().all(|(_, value)| value.is_none()) {
+        return Ok(None);
+    }
+
+    if let Some((name, _)) = fields.iter().find(|(_, value)| value.is_none()) {
+        return Err(anyhow::anyhow!("{name} missing").into());
+    }
+
+    let pop_key = base64::engine::general_purpose::STANDARD
+        .decode(inner.rdsaad_pop_key.as_deref().unwrap_or_default())
+        .context("rdsaad_pop_key is not base64")?;
+
+    Ok(Some(connector::rdsaad::RdsAadCredentials {
+        username: username.to_owned(),
+        access_token: inner.rdsaad_access_token.clone().unwrap_or_default(),
+        aad_nonce: inner.rdsaad_nonce.clone().unwrap_or_default(),
+        pop_key,
+        hostname: inner.rdsaad_hostname.clone().unwrap_or_default(),
+    }))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is one independent connection setting"
+)]
 fn build_config(
     username: String,
     password: String,
@@ -1517,6 +1581,7 @@ fn build_config(
     desktop_size: DesktopSize,
     legacy_graphics: bool,
     security: SecurityConfig,
+    rdsaad: Option<connector::rdsaad::RdsAadCredentials>,
 ) -> connector::Config {
     // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
     let bitmap = if legacy_graphics {
@@ -1533,8 +1598,13 @@ fn build_config(
         }
     };
 
+    let credentials = match rdsaad {
+        Some(credentials) => Credentials::RdsAad(credentials),
+        None => Credentials::UsernamePassword { username, password },
+    };
+
     connector::Config {
-        credentials: Credentials::UsernamePassword { username, password },
+        credentials,
         domain,
         enable_tls: !security.enable_standard_rdp_security,
         enable_credssp: security.enable_credssp && !security.enable_standard_rdp_security,
@@ -2030,6 +2100,7 @@ mod tests {
             },
             false,
             security,
+            None,
         )
     }
 

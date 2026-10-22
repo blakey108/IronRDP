@@ -23,6 +23,7 @@ mod input;
 mod network_client;
 mod printer;
 mod rdp_file;
+pub mod rdsaad;
 mod session;
 
 mod wasm_bridge {

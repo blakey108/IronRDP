@@ -211,6 +211,9 @@ pub enum ClientConnectorState {
     Credssp {
         selected_protocol: nego::SecurityProtocol,
     },
+    RdsAad {
+        selected_protocol: nego::SecurityProtocol,
+    },
     BasicSettingsExchangeSendInitial {
         selected_protocol: nego::SecurityProtocol,
     },
@@ -308,6 +311,7 @@ impl State for ClientConnectorState {
             Self::ConnectionInitiationWaitConfirm { .. } => "ConnectionInitiationWaitResponse",
             Self::EnhancedSecurityUpgrade { .. } => "EnhancedSecurityUpgrade",
             Self::Credssp { .. } => "Credssp",
+            Self::RdsAad { .. } => "RdsAad",
             Self::BasicSettingsExchangeSendInitial { .. } => "BasicSettingsExchangeSendInitial",
             Self::BasicSettingsExchangeWaitResponse { .. } => "BasicSettingsExchangeWaitResponse",
             Self::ChannelConnection { .. } => "ChannelConnection",
@@ -450,6 +454,12 @@ impl ClientConnector {
     }
 
     fn enabled_security_protocols(&self) -> ConnectorResult<nego::SecurityProtocol> {
+        if self.config.credentials.is_rdsaad() {
+            // RDS AAD Auth replaces CredSSP and runs over TLS. Advertising SSL or HYBRID alongside
+            // it would let the server pick an authentication the access token cannot satisfy.
+            return Ok(nego::SecurityProtocol::RDSAAD);
+        }
+
         let mut security_protocol = nego::SecurityProtocol::empty();
 
         if self.config.enable_tls {
@@ -628,6 +638,24 @@ impl ClientConnector {
 
     pub fn should_perform_credssp(&self) -> bool {
         matches!(self.state, ClientConnectorState::Credssp { .. })
+    }
+
+    pub fn should_perform_rdsaad(&self) -> bool {
+        matches!(self.state, ClientConnectorState::RdsAad { .. })
+    }
+
+    /// Advance past [`ClientConnectorState::RdsAad`] after RDS AAD Auth is already done.
+    ///
+    /// # Panics
+    ///
+    /// Panics if state is not [ClientConnectorState::RdsAad].
+    pub fn mark_rdsaad_as_done(&mut self) {
+        assert!(self.should_perform_rdsaad());
+        let res = self
+            .step(&[], None, &mut WriteBuf::new())
+            .expect("transition to next state");
+        debug_assert!(!self.should_perform_rdsaad());
+        assert_eq!(res, Written::Nothing);
     }
 
     /// Advance past [`ClientConnectorState::Credssp`] after NLA is already done.
@@ -1043,6 +1071,7 @@ impl Sequence for ClientConnector {
             ClientConnectorState::ConnectionInitiationWaitConfirm { .. } => Some(&ironrdp_pdu::X224_HINT),
             ClientConnectorState::EnhancedSecurityUpgrade { .. } => None,
             ClientConnectorState::Credssp { .. } => None,
+            ClientConnectorState::RdsAad { .. } => None,
             ClientConnectorState::BasicSettingsExchangeSendInitial { .. } => None,
             ClientConnectorState::BasicSettingsExchangeWaitResponse { .. } => Some(&ironrdp_pdu::X224_HINT),
             ClientConnectorState::ChannelConnection { channel_connection, .. } => channel_connection.next_pdu_hint(),
@@ -1148,6 +1177,9 @@ impl Sequence for ClientConnector {
                 let next_state = if selected_protocol.is_standard_rdp_security() {
                     debug!("Standard RDP security selected; skipping TLS and CredSSP");
                     ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol }
+                } else if selected_protocol.contains(nego::SecurityProtocol::RDSAAD) {
+                    debug!("Begin RDS AAD Auth");
+                    ClientConnectorState::RdsAad { selected_protocol }
                 } else if selected_protocol
                     .intersects(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX)
                 {
@@ -1163,6 +1195,12 @@ impl Sequence for ClientConnector {
 
             //== CredSSP ==//
             ClientConnectorState::Credssp { selected_protocol } => (
+                Written::Nothing,
+                ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol },
+            ),
+
+            //== RDS AAD Auth ==//
+            ClientConnectorState::RdsAad { selected_protocol } => (
                 Written::Nothing,
                 ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol },
             ),

@@ -9,6 +9,7 @@ pub mod connection_activation;
 mod connection_finalization;
 pub mod credssp;
 mod license_exchange;
+pub mod rdsaad;
 mod server_name;
 
 use core::any::Any;
@@ -120,6 +121,11 @@ pub enum Credentials {
         pin: String,
         config: Option<SmartCardIdentity>,
     },
+    /// Microsoft Entra ID access token, authenticated with RDS AAD Auth instead of CredSSP.
+    ///
+    /// The connector requests only `PROTOCOL_RDSAAD` during negotiation, regardless of
+    /// `enable_tls` and `enable_credssp`, so the server cannot downgrade the authentication.
+    RdsAad(rdsaad::RdsAadCredentials),
 }
 
 impl Credentials {
@@ -128,6 +134,8 @@ impl Credentials {
             Self::UsernamePassword { username, .. } if !username.is_empty() => Some(username),
             Self::UsernamePassword { .. } => None,
             Self::SmartCard { .. } => None, // Username is ultimately provided by the smart card certificate.
+            Self::RdsAad(credentials) if !credentials.username.is_empty() => Some(&credentials.username),
+            Self::RdsAad(_) => None, // The server derives the user from the access token.
         }
     }
 
@@ -135,7 +143,12 @@ impl Credentials {
         match self {
             Self::UsernamePassword { password, .. } => password,
             Self::SmartCard { pin, .. } => pin,
+            Self::RdsAad(_) => "",
         }
+    }
+
+    fn is_rdsaad(&self) -> bool {
+        matches!(self, Self::RdsAad(_))
     }
 }
 
@@ -441,6 +454,7 @@ pub enum ConnectorErrorKind {
     General,
     Custom,
     Negotiation(NegotiationFailure),
+    RdsAad(rdsaad::RdsAadAuthFailure),
 }
 
 impl fmt::Display for ConnectorErrorKind {
@@ -454,6 +468,7 @@ impl fmt::Display for ConnectorErrorKind {
             ConnectorErrorKind::General => write!(f, "general error"),
             ConnectorErrorKind::Custom => write!(f, "custom error"),
             ConnectorErrorKind::Negotiation(failure) => write!(f, "negotiation failure: {failure}"),
+            ConnectorErrorKind::RdsAad(failure) => write!(f, "RDS AAD Auth failure: {failure}"),
         }
     }
 }
@@ -469,6 +484,7 @@ impl core::error::Error for ConnectorErrorKind {
             ConnectorErrorKind::Custom => None,
             ConnectorErrorKind::General => None,
             ConnectorErrorKind::Negotiation(failure) => Some(failure),
+            ConnectorErrorKind::RdsAad(failure) => Some(failure),
         }
     }
 }

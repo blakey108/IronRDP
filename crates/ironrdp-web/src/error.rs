@@ -1,4 +1,5 @@
 use iron_remote_desktop::{IronErrorKind, RDCleanPathDetails};
+use ironrdp::connector::rdsaad::RdsAadAuthFailure;
 use ironrdp::connector::{self, ConnectorErrorKind, sspi};
 
 pub(crate) struct IronError {
@@ -52,6 +53,13 @@ impl From<connector::ConnectorError> for IronError {
             }) => IronErrorKind::LogonFailure,
             ConnectorErrorKind::AccessDenied => IronErrorKind::AccessDenied,
             ConnectorErrorKind::Negotiation(_) => IronErrorKind::NegotiationFailure,
+            ConnectorErrorKind::RdsAad(failure) => match *failure {
+                RdsAadAuthFailure::E_ACCESSDENIED => IronErrorKind::AccessDenied,
+                RdsAadAuthFailure::STATUS_LOGON_FAILURE | RdsAadAuthFailure::SEC_E_INVALID_TOKEN => {
+                    IronErrorKind::LogonFailure
+                }
+                _ => IronErrorKind::General,
+            },
             _ => IronErrorKind::General,
         };
 

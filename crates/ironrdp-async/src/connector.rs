@@ -1,4 +1,5 @@
 use ironrdp_connector::credssp::{CredsspProcessGenerator, CredsspSequence, KerberosConfig};
+use ironrdp_connector::rdsaad::RdsAadSequence;
 use ironrdp_connector::sspi::credssp::ClientState;
 use ironrdp_connector::sspi::generator::GeneratorState;
 use ironrdp_connector::{
@@ -122,6 +123,10 @@ where
             kerberos_config,
         )
         .await?;
+    }
+
+    if connector.should_perform_rdsaad() {
+        perform_rdsaad_step(&mut connector, framed, &mut buf).await?;
     }
 
     let result = loop {
@@ -264,6 +269,79 @@ where
     }
 
     Ok(())
+}
+
+/// Run the RDS AAD Auth exchange on an already-TLS stream.
+///
+/// Does not touch [`ClientConnector`] state; callers that drive a connector should call
+/// [`ClientConnector::mark_rdsaad_as_done`] afterwards when appropriate.
+#[instrument(level = "trace", skip_all)]
+pub async fn perform_rdsaad<S>(
+    framed: &mut Framed<S>,
+    buf: &mut WriteBuf,
+    mut sequence: RdsAadSequence,
+) -> ConnectorResult<()>
+where
+    S: FramedRead + FramedWrite,
+{
+    // The server sends the first PDU, so each round reads before it writes.
+    while let Some(next_pdu_hint) = sequence.next_pdu_hint() {
+        debug!(hint = ?next_pdu_hint, "Wait for PDU");
+
+        let pdu = framed
+            .read_by_hint(next_pdu_hint)
+            .await
+            .map_err(|e| ironrdp_connector::custom_err!("read frame by hint", e))?;
+
+        trace!(length = pdu.len(), "PDU received");
+
+        buf.clear();
+        let written = sequence.step(&pdu, buf)?;
+
+        if let Some(response_len) = written.size() {
+            let response = &buf[..response_len];
+            trace!(response_len, "Send response");
+            framed
+                .write_all(response)
+                .await
+                .map_err(|e| ironrdp_connector::custom_err!("write all", e))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[instrument(level = "trace", skip_all)]
+async fn perform_rdsaad_step<S>(
+    connector: &mut ClientConnector,
+    framed: &mut Framed<S>,
+    buf: &mut WriteBuf,
+) -> ConnectorResult<()>
+where
+    S: FramedRead + FramedWrite,
+{
+    assert!(connector.should_perform_rdsaad());
+
+    let ironrdp_connector::Credentials::RdsAad(credentials) = &connector.config.credentials else {
+        return Err(general_err!("RDS AAD Auth was negotiated without RDS AAD credentials"));
+    };
+
+    debug!(connector.state = connector.state.name(), "Begin RDS AAD Auth");
+
+    let sequence = RdsAadSequence::init(credentials.clone(), unix_time_secs())?;
+
+    perform_rdsaad(framed, buf, sequence).await?;
+
+    connector.mark_rdsaad_as_done();
+
+    Ok(())
+}
+
+/// Current Unix time in seconds; `web_time` falls back to the JavaScript clock on WebAssembly.
+fn unix_time_secs() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 #[instrument(level = "trace", skip_all)]

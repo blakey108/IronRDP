@@ -7,6 +7,7 @@ import wasm_init, {
     ClipboardData,
     Extension,
     RdpFile,
+    rdsAadPopKeyReqCnf,
 } from '../../../crates/ironrdp-web/pkg/ironrdp_web';
 
 export async function init(log_level: string) {
@@ -55,6 +56,35 @@ export function outboundMessageSizeLimit(limit: number): Extension {
 
 export function enableCredssp(enable: boolean): Extension {
     return new Extension('enable_credssp', enable);
+}
+
+// --- RDS AAD Auth (Microsoft Entra ID) ---
+//
+// Setting any of these selects RDS AAD Auth instead of CredSSP; all four are then required.
+// The access token must be requested with the `req_cnf` value returned by
+// `rdsAadPopKeyReqCnf` for the same key, for the scope
+// `ms-device-service://termsrv.wvd.microsoft.com/name/<hostname>/user_impersonation`.
+
+export { rdsAadPopKeyReqCnf };
+
+/** Entra ID access token bound to the proof-of-possession key. */
+export function rdsAadAccessToken(token: string): Extension {
+    return new Extension('rdsaad_access_token', token);
+}
+
+/** Entra ID nonce obtained from the token endpoint with `grant_type=srv_challenge`. */
+export function rdsAadNonce(nonce: string): Extension {
+    return new Extension('rdsaad_nonce', nonce);
+}
+
+/** Base64-encoded PKCS#8 RSA private key the access token is bound to. */
+export function rdsAadPopKey(popKey: string): Extension {
+    return new Extension('rdsaad_pop_key', popKey);
+}
+
+/** Entra ID device name of the target, as used in the token scope. */
+export function rdsAadHostname(hostname: string): Extension {
+    return new Extension('rdsaad_hostname', hostname);
 }
 
 /**

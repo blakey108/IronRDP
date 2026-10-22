@@ -109,6 +109,9 @@ impl CredsspSequence {
                 }
                 .into()
             }
+            Credentials::RdsAad(_) => {
+                return Err(general_err!("RDS AAD Auth credentials cannot be used with CredSSP"));
+            }
             Credentials::SmartCard { pin, config } => match config {
                 Some(config) => {
                     let cert: Certificate = picky_asn1_der::from_bytes(&config.certificate)

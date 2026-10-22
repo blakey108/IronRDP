@@ -2843,6 +2843,7 @@ dependencies = [
 name = "ironrdp-connector"
 version = "0.10.0"
 dependencies = [
+ "base64 0.22.1",
  "ironrdp-core 0.2.1",
  "ironrdp-error 0.2.0",
  "ironrdp-pdu",
@@ -2851,6 +2852,7 @@ dependencies = [
  "picky-asn1-der",
  "picky-asn1-x509",
  "rand 0.9.4",
+ "serde_json",
  "sspi",
  "tracing",
  "url",
@@ -3453,6 +3455,7 @@ dependencies = [
  "anyhow",
  "array-concat",
  "async-trait",
+ "base64 0.22.1",
  "expect-test",
  "hex",
  "ironrdp-acceptor",
@@ -3495,10 +3498,12 @@ dependencies = [
  "ironrdp-usb",
  "openh264",
  "paste",
+ "picky",
  "png",
  "pretty_assertions",
  "proptest",
  "rstest",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "visibility",
