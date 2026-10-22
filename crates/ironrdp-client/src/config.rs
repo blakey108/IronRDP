@@ -499,6 +499,13 @@ pub enum Transport {
     #[cfg(feature = "gateway")]
     Gateway(GatewayConfig),
 
+    /// Connect via an RDS gateway using authenticated RPC over HTTP (MS-RPCH).
+    ///
+    /// This opt-in path does not fall back to unsigned RPC. Finite RPCH channel lifetimes are
+    /// reported as errors because channel recycling is not supported.
+    #[cfg(feature = "gateway")]
+    GatewayRpch(GatewayConfig),
+
     /// Connect via an RDCleanPath proxy (WebSocket-based).
     RDCleanPath(RDCleanPathConfig),
 
@@ -542,6 +549,19 @@ pub enum TransportKind {
         endpoint: String,
         /// When `true` (`GatewayUsageMethod::Detect`), try a direct TCP connection first and fall
         /// back to the gateway only if that fails.
+        prefer_direct: bool,
+    },
+
+    /// Connect through an RDS gateway using authenticated RPC over HTTP (MS-RPCH).
+    ///
+    /// This path is selected only explicitly and does not fall back to unsigned RPC. Finite
+    /// RPCH channel lifetimes are reported as errors because channel recycling is not supported.
+    #[cfg(feature = "gateway")]
+    GatewayRpch {
+        /// Gateway endpoint address (e.g., `"rdg.contoso.com:443"`).
+        endpoint: String,
+        /// When `true` (`GatewayUsageMethod::Detect`), try a direct TCP connection first and fall
+        /// back to RPCH only if that fails.
         prefer_direct: bool,
     },
 
@@ -1275,7 +1295,8 @@ impl ConfigBuilder {
     /// [`with_rdcleanpath_token`](Self::with_rdcleanpath_token).
     /// A `gatewaycredentialssource` property of
     /// [`UseServerCredentials`](ironrdp_cfg::GatewayCredentialsSource::UseServerCredentials)
-    /// resolves unspecified gateway credentials from the RDP server account.
+    /// resolves unspecified gateway credentials from the RDP server account. `GatewayRpch` is an
+    /// explicit API selection; gateway properties continue to select the existing gateway path.
     #[must_use]
     pub fn with_transport(mut self, transport: TransportKind) -> Self {
         match &transport {
@@ -1293,6 +1314,10 @@ impl ConfigBuilder {
             }
             #[cfg(feature = "gateway")]
             TransportKind::Gateway {
+                endpoint,
+                prefer_direct,
+            }
+            | TransportKind::GatewayRpch {
                 endpoint,
                 prefer_direct,
             } => {
@@ -1713,11 +1738,13 @@ impl ConfigBuilder {
         #[cfg(not(all(windows, feature = "vmconnect")))]
         let uses_current_vmconnect_credentials = false;
         #[cfg(feature = "gateway")]
-        let gateway_uses_server_credentials = matches!(self.transport, TransportKind::Gateway { .. })
-            && matches!(
-                self.properties.gateway_credentials_source(),
-                Ok(Some(ironrdp_cfg::GatewayCredentialsSource::UseServerCredentials))
-            );
+        let gateway_uses_server_credentials = matches!(
+            self.transport,
+            TransportKind::Gateway { .. } | TransportKind::GatewayRpch { .. }
+        ) && matches!(
+            self.properties.gateway_credentials_source(),
+            Ok(Some(ironrdp_cfg::GatewayCredentialsSource::UseServerCredentials))
+        );
         #[cfg(not(feature = "gateway"))]
         let gateway_uses_server_credentials = false;
         if self.destination.is_none() {
@@ -1736,7 +1763,11 @@ impl ConfigBuilder {
             missing.push(MissingField::Password);
         }
         #[cfg(feature = "gateway")]
-        if matches!(self.transport, TransportKind::Gateway { .. }) && !gateway_uses_server_credentials {
+        if matches!(
+            self.transport,
+            TransportKind::Gateway { .. } | TransportKind::GatewayRpch { .. }
+        ) && !gateway_uses_server_credentials
+        {
             if self.gateway_username.is_none() {
                 missing.push(MissingField::GatewayUsername);
             }
@@ -1788,7 +1819,10 @@ impl ConfigBuilder {
         }
 
         #[cfg(feature = "gateway")]
-        if matches!(self.transport, TransportKind::Gateway { .. }) {
+        if matches!(
+            self.transport,
+            TransportKind::Gateway { .. } | TransportKind::GatewayRpch { .. }
+        ) {
             use ironrdp_cfg::GatewayCredentialsSource;
 
             match self
@@ -1937,6 +1971,16 @@ impl ConfigBuilder {
                 endpoint,
                 prefer_direct,
             } => Transport::Gateway(GatewayConfig {
+                endpoint,
+                username: self.gateway_username.unwrap(),
+                password: self.gateway_password.unwrap(),
+                prefer_direct,
+            }),
+            #[cfg(feature = "gateway")]
+            TransportKind::GatewayRpch {
+                endpoint,
+                prefer_direct,
+            } => Transport::GatewayRpch(GatewayConfig {
                 endpoint,
                 username: self.gateway_username.unwrap(),
                 password: self.gateway_password.unwrap(),
@@ -2601,6 +2645,57 @@ mod tests {
             endpoint: "gateway.example:443".to_owned(),
             prefer_direct: false,
         })
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn rpch_gateway_requires_explicit_selection_and_preserves_legacy_default() {
+        let legacy = gateway_builder()
+            .with_gateway_username("gateway-user")
+            .with_gateway_password("gateway-password")
+            .build()
+            .expect("valid legacy gateway configuration");
+        assert!(matches!(legacy.transport(), Transport::Gateway(_)));
+
+        let rpch = complete_builder()
+            .with_transport(TransportKind::GatewayRpch {
+                endpoint: "gateway.example:443".to_owned(),
+                prefer_direct: false,
+            })
+            .with_gateway_username("gateway-user")
+            .with_gateway_password("gateway-password")
+            .build()
+            .expect("valid explicit RPCH gateway configuration");
+        let Transport::GatewayRpch(gateway) = rpch.transport() else {
+            panic!("explicit RPCH gateway transport expected");
+        };
+        assert_eq!(gateway.endpoint, "gateway.example:443");
+        assert_eq!(gateway.username, "gateway-user");
+        assert_eq!(gateway.password, "gateway-password");
+        assert!(!gateway.prefer_direct);
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn rpch_gateway_resolves_server_credentials() {
+        let mut properties = ironrdp_propertyset::PropertySet::new();
+        properties.set_gateway_credentials_source(ironrdp_cfg::GatewayCredentialsSource::UseServerCredentials);
+        let config = complete_builder()
+            .with_transport(TransportKind::GatewayRpch {
+                endpoint: "gateway.example:443".to_owned(),
+                prefer_direct: false,
+            })
+            .with_property_set(&properties)
+            .expect("valid gateway credentials source")
+            .with_domain("CONTOSO")
+            .build()
+            .expect("valid RPCH server credential configuration");
+
+        let Transport::GatewayRpch(gateway) = config.transport() else {
+            panic!("explicit RPCH gateway transport expected");
+        };
+        assert_eq!(gateway.username, "CONTOSO\\user");
+        assert_eq!(gateway.password, "password");
     }
 
     #[cfg(feature = "gateway")]

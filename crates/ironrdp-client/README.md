@@ -33,9 +33,12 @@ On Windows the default decoder is the one shipped with Windows, through Media Fo
 Windows servers only keep the video channels open when the graphics pipeline is enabled (`ConfigBuilder::with_graphics_pipeline`, or the `ironrdp_egfx:i:1` `.rdp` property).
 Decoded pictures are shown at their presentation time, scaled and clipped to the tracked geometry, and composited into the framebuffer like graphics pipeline updates.
 
-When the `gateway` feature is enabled and `Transport::Gateway` is selected, the client uses the MS-TSGU HTTPS WebSocket transport and falls back to legacy dual-channel HTTP when necessary.
+When the `gateway` feature is enabled, `Transport::Gateway` uses the MS-TSGU HTTPS WebSocket transport and falls back to legacy dual-channel HTTP when necessary.
 It handles `HTTP_REAUTH_MESSAGE` through a short-lived background reauthentication transport without disrupting the active data transport.
-The gateway path does not provide a live RPC-over-HTTP (RPCH) transport or RDG-UDP/DTLS side channel.
+Select `TransportKind::GatewayRpch` explicitly to use the authenticated MS-RPCH v2 and TS Proxy stream.
+RPCH verifies RPC packet integrity independently of TLS and HTTP authentication; the legacy gateway selection remains the default, and neither transport falls back to unsigned RPC.
+The RPCH stream does not support channel recycling, HTTP reauthentication, or consent callbacks, so those events end the connection with an error.
+Gateway UDP/DTLS remains unsupported, and interoperability with a live RD Gateway has not been verified.
 
 For the end-user RDP client binary, see [`ironrdp-viewer`](../ironrdp-viewer).
 
