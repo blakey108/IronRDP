@@ -35,6 +35,8 @@ writeable = "writeable"
 # CBOR Object Signing and Encryption (WebAuthn COSE algorithms / Windows APIs).
 COSE = "COSE"
 cose = "cose"
+# Windows notification icon callback messages (`NIN_SELECT`, `NIN_BALLOONUSERCLICK`).
+NIN = "NIN"
 
 [default.extend-identifiers]
 # COM FORMATETC target-device field.
