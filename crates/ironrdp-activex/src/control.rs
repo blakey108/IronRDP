@@ -20,7 +20,7 @@ use ironrdp_client::config::{
     AudioQualityMode, ClipboardType, ConfigBuilder, Destination, RDCleanPathConfig, Transport, TransportKind,
 };
 use ironrdp_client::output_channel::output_channel;
-use ironrdp_client::rail::RailInputEvent;
+use ironrdp_client::rail::{RailControlEvent, RailInputEvent};
 use ironrdp_client::rdp::{
     AutoReconnectDecision, CliprdrBackendFactory, DesktopUpdate, LocationInputError, RdpClient, RdpInputEvent,
     RdpInputSender, RdpOutputEvent,
@@ -44,11 +44,15 @@ use ironrdp_pdu::rdp::{
     capability_sets::{MajorPlatformType, RailSupportLevel},
     client_info::PerformanceFlags,
 };
-use ironrdp_pdu::window::{ShowState, WindowOrder, WindowOrderBody, WindowingOrder};
+use ironrdp_pdu::window::{
+    DesktopOrder, MonitoredDesktop, NotifyIconOrder, ShowState, WindowIcon, WindowOrder, WindowOrderBody, WindowState,
+    WindowingOrder,
+};
 use ironrdp_pdu::{PduError, PduErrorKind, PduResult};
 use ironrdp_propertyset::{PropertySet, Value};
 use ironrdp_rail::pdu::{
-    ActivatePdu, ExecutePdu, ExecuteResult, ExecuteResultPdu, RailPdu, SystemCommand, SystemCommandPdu,
+    ActivatePdu, ClientStatusPdu, ExecutePdu, ExecuteResult, ExecuteResultPdu, LocalMoveSizePdu, RailPdu,
+    Rectangle as RailRectangle, SystemCommand, SystemCommandPdu, WindowMovePdu,
 };
 use ironrdp_rdpei::pdu::{
     PenContact, PenContactDataFlags, PenContactFlags, PenEventPdu, PenFlags, PenFrame, TouchContact, TouchContactFlags,
@@ -126,8 +130,9 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetKeyState, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
-    TrackMouseEvent, VIRTUAL_KEY, VK_CANCEL, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_PAUSE, VK_SHIFT, VK_TAB,
+    EnableWindow, GetAsyncKeyState, GetKeyState, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
+    TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_CANCEL, VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_MENU, VK_PAUSE,
+    VK_RBUTTON, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::Input::Pointer::{
     GetPointerFrameTouchInfo, GetPointerInfo, POINTER_FLAG_CANCELED, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE,
@@ -138,16 +143,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GA_ROOT, GA_ROOTOWNER,
     GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GWLP_USERDATA, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos,
     GetDlgItem, GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, HMENU, HWND_MESSAGE, IsIconic, IsWindow, IsWindowVisible, KillTimer, PT_TOUCH,
-    PostMessageW, RegisterClassW, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, SIZE_MINIMIZED, SW_HIDE,
-    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER,
-    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TOUCH_MASK_CONTACTAREA,
-    TOUCH_MASK_ORIENTATION, TOUCH_MASK_PRESSURE, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_APP,
-    WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENABLE, WM_KEYDOWN,
+    GetWindowThreadProcessId, HMENU, HWND_MESSAGE, HWND_TOP, IsIconic, IsWindow, IsWindowVisible, KillTimer,
+    MINMAXINFO, PT_TOUCH, PostMessageW, RegisterClassW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SIZE_MINIMIZED, SW_HIDE,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TOUCH_MASK_CONTACTAREA, TOUCH_MASK_ORIENTATION, TOUCH_MASK_PRESSURE, UnregisterClassW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENABLE, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN,
-    WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SHOWWINDOW, WM_SIZE,
-    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD,
+    WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SHOWWINDOW,
+    WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{s, w};
@@ -174,6 +180,12 @@ use crate::mstsc::{
     IMsTscNonScriptable, IMsTscNonScriptable_Impl, IRemoteDesktopClient, IRemoteDesktopClient_Impl,
     IRemoteDesktopClientActions, IRemoteDesktopClientActions_Impl, IRemoteDesktopClientSettings,
     IRemoteDesktopClientSettings_Impl, InterfaceOut,
+};
+use crate::rail_icons::RailIconCache;
+use crate::rail_tray::RailTray;
+use crate::rail_windows::{
+    LocalMoveSizeMode, RailWindowShell, RailWindowSurface, WindowUpdate, apply_min_max_info, apply_window_region,
+    local_move_size_command, local_system_parameters, set_window_cloak,
 };
 use crate::rpc::{self, ActiveXRpc, Command as RpcCommand};
 use crate::touch::{TouchContactTracker, TouchSample};
@@ -381,13 +393,18 @@ fn rail_window_input_event(window_id: u32, message: u32, wparam: WPARAM) -> Opti
     }
 }
 
-fn is_unsupported_projected_rail_system_command(wparam: WPARAM) -> bool {
-    let command = wparam.0 & 0xfff0;
-    command == SC_MOVE as usize
-        || command == SC_SIZE as usize
-        || command == SC_MINIMIZE as usize
-        || command == SC_MAXIMIZE as usize
-        || command == SC_RESTORE as usize
+/// Returns the server command for a window state change the server must perform.
+///
+/// Minimizing, maximizing and restoring a projected window change the server window's
+/// show state, which the server reports back in a window order, so the local window
+/// waits for that order instead of changing state on its own.
+fn projected_rail_system_command(wparam: WPARAM) -> Option<SystemCommand> {
+    match (wparam.0 & 0xfff0) as u32 {
+        SC_MINIMIZE => Some(SystemCommand::Minimize),
+        SC_MAXIMIZE => Some(SystemCommand::Maximize),
+        SC_RESTORE => Some(SystemCommand::Restore),
+        _ => None,
+    }
 }
 
 pub(crate) const CLSID_MS_RDP_CLIENT: GUID = GUID::from_u128(0x791f_a017_2de3_492e_acc5_53c6_7a2b_94d0);
@@ -4692,6 +4709,14 @@ enum WorkerEvent {
         executable: String,
         flags: u16,
     },
+    RailControl {
+        generation: u64,
+        control: RailControlEvent,
+    },
+    RailWindowSurfaces {
+        generation: u64,
+        updates: Vec<WindowUpdate>,
+    },
     AutoReconnecting {
         generation: u64,
         disconnect_reason: u32,
@@ -4733,6 +4758,8 @@ impl WorkerEvent {
             | Self::RailWindowingOrders { generation, .. }
             | Self::RailExecuteResult { generation, .. }
             | Self::RailExecuteFailed { generation, .. }
+            | Self::RailControl { generation, .. }
+            | Self::RailWindowSurfaces { generation, .. }
             | Self::AutoReconnecting { generation, .. }
             | Self::AutoReconnected { generation }
             | Self::FatalError { generation, .. }
@@ -5495,6 +5522,8 @@ struct ProjectedRailWindowContext {
     frame: Rc<RefCell<Option<Frame>>>,
     presentation_surface: Rc<RefCell<Option<PresentationSurface>>>,
     content: Rc<Cell<ProjectedRailContent>>,
+    geometry: Rc<Cell<ProjectedRailGeometry>>,
+    shell: RailWindowShell,
     close_pending: Cell<bool>,
     close_queued: Cell<bool>,
     release_pending: Cell<bool>,
@@ -5507,7 +5536,7 @@ struct ProjectedRailWindow {
     content: Rc<Cell<ProjectedRailContent>>,
     server_style: WINDOW_STYLE,
     server_extended_style: WINDOW_EX_STYLE,
-    _context: Box<ProjectedRailWindowContext>,
+    context: Box<ProjectedRailWindowContext>,
 }
 
 struct ProjectedRailWindowOrder {
@@ -5625,6 +5654,11 @@ fn schedule_projected_rail_input_retry(hwnd: HWND) {
 }
 
 fn release_projected_rail_input(hwnd: HWND, context: &ProjectedRailWindowContext) {
+    if context.shell.local_move_size.get() == Some(LocalMoveSizeMode::Mouse) {
+        // The button that started the move stays down on the server until the move
+        // ends, when the window's final position is reported before it is released.
+        return;
+    }
     let permit = match context.input_sender.try_reserve() {
         Ok(permit) => permit,
         Err(error) => {
@@ -5749,6 +5783,43 @@ fn projected_rail_mouse_position(
     })
 }
 
+/// Paints the content area from the graphics pipeline surface mapped to the window.
+///
+/// The surface covers the whole server window, so the server client area is found
+/// relative to the window origin and scaled to the surface's presented size.
+fn paint_projected_rail_window_surface(
+    device_context: HDC,
+    context: &ProjectedRailWindowContext,
+    client_width: i32,
+    client_height: i32,
+) -> Option<bool> {
+    let surface = context.shell.surface.borrow();
+    let surface = surface.as_ref()?.borrow();
+    let geometry = context.geometry.get();
+    let content_rect = context.content.get();
+    let (surface_width, surface_height) = surface.size();
+    let scale_x =
+        |value: i32| i32::try_from(i64::from(value) * i64::from(surface_width) / i64::from(geometry.width.max(1))).ok();
+    let scale_y = |value: i32| {
+        i32::try_from(i64::from(value) * i64::from(surface_height) / i64::from(geometry.height.max(1))).ok()
+    };
+    let left = content_rect.x.saturating_sub(geometry.x);
+    let top = content_rect.y.saturating_sub(geometry.y);
+    let source = RECT {
+        left: scale_x(left)?,
+        top: scale_y(top)?,
+        right: scale_x(left.saturating_add(content_rect.width))?,
+        bottom: scale_y(top.saturating_add(content_rect.height))?,
+    };
+    let destination = RECT {
+        left: 0,
+        top: 0,
+        right: client_width,
+        bottom: client_height,
+    };
+    Some(surface.paint(device_context, destination, source))
+}
+
 fn paint_projected_rail_window(hwnd: HWND, context: &ProjectedRailWindowContext) {
     let mut paint = PAINTSTRUCT::default();
     let device_context = unsafe { BeginPaint(hwnd, &mut paint) };
@@ -5757,6 +5828,19 @@ fn paint_projected_rail_window(hwnd: HWND, context: &ProjectedRailWindowContext)
         let client_width = (client_rect.right - client_rect.left).max(0);
         let client_height = (client_rect.bottom - client_rect.top).max(0);
         let content_rect = context.content.get();
+        if let Some(painted) = paint_projected_rail_window_surface(device_context, context, client_width, client_height)
+        {
+            if !painted {
+                tracing::debug!(
+                    window_id = context.window_id,
+                    "Unable to paint projected RAIL window surface"
+                );
+            }
+            unsafe {
+                let _ = EndPaint(hwnd, &paint);
+            }
+            return;
+        }
         let surface = context.presentation_surface.borrow();
         if let Some(surface) = surface.as_ref()
             && content_rect.width > 0
@@ -5804,15 +5888,57 @@ fn handle_projected_rail_window_message(
         retry_projected_rail_input(hwnd, context);
         return true;
     }
-    if message == WM_SYSCOMMAND && is_unsupported_projected_rail_system_command(wparam) {
-        // ActiveX does not implement the server-directed move/size lifecycle.
+    if message == WM_SYSCOMMAND
+        && let Some(command) = projected_rail_system_command(wparam)
+    {
+        queue_projected_rail_lifecycle_input(
+            context,
+            RailInputEvent::SystemCommand(SystemCommandPdu {
+                window_id: context.window_id,
+                command,
+            }),
+        );
         return true;
     }
-    if let Some(event) = rail_window_input_event(context.window_id, message, wparam) {
+    if !(message == WM_ACTIVATE && context.shell.suppress_activation.get())
+        && let Some(event) = rail_window_input_event(context.window_id, message, wparam)
+    {
         queue_projected_rail_lifecycle_input(context, event);
     }
 
     match message {
+        WM_GETMINMAXINFO => {
+            let Some(min_max) = context.shell.min_max.get() else {
+                return false;
+            };
+            // SAFETY: WM_GETMINMAXINFO passes a MINMAXINFO the system owns for this call.
+            if let Some(info) = unsafe { (lparam.0 as *mut MINMAXINFO).as_mut() } {
+                apply_min_max_info(info, &min_max);
+            }
+            true
+        }
+        WM_ENTERSIZEMOVE => {
+            if context.shell.local_move_size.get().is_none() {
+                // A move or resize started from the local frame or System menu.
+                context.shell.local_move_size.set(Some(LocalMoveSizeMode::Local));
+            }
+            false
+        }
+        WM_EXITSIZEMOVE => {
+            finish_projected_rail_move_size(hwnd, context);
+            false
+        }
+        WM_SETTINGCHANGE => {
+            // Settings broadcasts reach top-level windows only, so projected windows
+            // report them; the RAIL channel sends only values that changed.
+            if let Err(error) = context
+                .input_sender
+                .try_send(RdpInputEvent::RailSystemParameters(local_system_parameters()))
+            {
+                tracing::debug!(?error, "Unable to report changed RAIL system parameters");
+            }
+            false
+        }
         WM_PAINT => {
             paint_projected_rail_window(hwnd, context);
             true
@@ -5946,6 +6072,48 @@ fn handle_projected_rail_window_message(
     }
 }
 
+/// Reports the window's final rectangle after a local move or resize
+/// ([MS-RDPERP] 3.2.5.2.6), then releases the mouse button that drove a
+/// server-initiated move so the server ends its own move loop.
+///
+/// [MS-RDPERP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdperp
+fn finish_projected_rail_move_size(hwnd: HWND, context: &ProjectedRailWindowContext) {
+    let Some(mode) = context.shell.local_move_size.take() else {
+        return;
+    };
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
+        let clamp = |value: i32| value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        queue_projected_rail_lifecycle_input(
+            context,
+            RailInputEvent::WindowMove(WindowMovePdu {
+                window_id: context.window_id,
+                rectangle: RailRectangle {
+                    left: clamp(rect.left),
+                    top: clamp(rect.top),
+                    right: clamp(rect.right),
+                    bottom: clamp(rect.bottom),
+                },
+            }),
+        );
+    }
+    if mode == LocalMoveSizeMode::Mouse {
+        let mut operations = Vec::new();
+        let mut point = POINT::default();
+        if unsafe { GetCursorPos(&mut point) }.is_ok()
+            && unsafe { ScreenToClient(hwnd, &mut point) }.as_bool()
+            && let Some(position) = projected_rail_mouse_position(context, hwnd, point.x, point.y)
+        {
+            operations.push(Operation::MouseMove(position));
+        }
+        // Either button can drive the move (as the start-side check allows); the input
+        // database only releases the one the server saw pressed.
+        operations.push(Operation::MouseButtonReleased(MouseButton::Left));
+        operations.push(Operation::MouseButtonReleased(MouseButton::Right));
+        apply_projected_rail_input(context, operations);
+    }
+}
+
 unsafe extern "system" fn projected_rail_window_proc(
     hwnd: HWND,
     message: u32,
@@ -5976,6 +6144,10 @@ struct RailWindowManager {
     presentation_surface: Rc<RefCell<Option<PresentationSurface>>>,
     input_sender: Option<RdpInputSender>,
     windows: BTreeMap<u32, ProjectedRailWindow>,
+    icons: RailIconCache,
+    tray: Option<RailTray>,
+    /// Graphics pipeline surfaces mapped to RAIL windows, kept for windows created later.
+    surfaces: BTreeMap<u32, Rc<RefCell<RailWindowSurface>>>,
 }
 
 impl RailWindowManager {
@@ -5992,6 +6164,9 @@ impl RailWindowManager {
             presentation_surface,
             input_sender: None,
             windows: BTreeMap::new(),
+            icons: RailIconCache::default(),
+            tray: None,
+            surfaces: BTreeMap::new(),
         }
     }
 
@@ -6012,18 +6187,241 @@ impl RailWindowManager {
     fn consume(&mut self, orders: Vec<WindowingOrder>) {
         for order in orders {
             match order {
-                WindowingOrder::Desktop(desktop) if desktop.resets_windows() => self.clear(),
                 WindowingOrder::Window(WindowOrder {
                     window_id,
                     body: WindowOrderBody::Deleted,
                     ..
                 }) => self.destroy_window(window_id),
+                WindowingOrder::Window(WindowOrder {
+                    window_id,
+                    body: WindowOrderBody::Icon(icon),
+                    ..
+                }) => self.apply_window_icon(window_id, &icon),
                 WindowingOrder::Window(order) => {
+                    let window_id = order.window_id;
+                    let shape = match &order.body {
+                        WindowOrderBody::State(state) => Some(WindowState {
+                            window_rects: state.window_rects.clone(),
+                            visibility_rects: state.visibility_rects.clone(),
+                            visible_offset: state.visible_offset,
+                            ..WindowState::default()
+                        }),
+                        _ => None,
+                    };
                     if let Some(order) = projected_rail_window_order(order) {
                         self.apply_window_order(order);
                     }
+                    if let Some(shape) = shape {
+                        self.apply_window_shape(window_id, &shape);
+                    }
                 }
-                WindowingOrder::NotifyIcon(_) | WindowingOrder::Desktop(_) => {}
+                WindowingOrder::NotifyIcon(order) => self.apply_notify_icon(order),
+                WindowingOrder::Desktop(desktop) => {
+                    // A non-monitored desktop, or the start of an auto-reconnect resend,
+                    // discards every window, icon and notification icon first.
+                    if desktop.resets_windows() {
+                        self.clear();
+                    }
+                    if let DesktopOrder::ActivelyMonitored(desktop) = desktop {
+                        self.apply_desktop(desktop);
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_window_icon(&mut self, window_id: u32, icon: &WindowIcon) {
+        // Resolve even for unknown windows, so inline icons still reach the cache.
+        let Some(handle) = self.icons.resolve(&icon.icon) else {
+            return;
+        };
+        if icon.overlay {
+            // Taskbar overlay icons are not projected.
+            return;
+        }
+        if let Some(window) = self.windows.get(&window_id) {
+            window.context.shell.set_icon(window.hwnd, icon.big, handle);
+        }
+    }
+
+    fn apply_window_shape(&self, window_id: u32, state: &WindowState) {
+        let Some(window) = self.windows.get(&window_id) else {
+            return;
+        };
+        let shell = &window.context.shell;
+        shell.shape.borrow_mut().update(state);
+        let geometry = window.geometry.get();
+        let region = shell
+            .shape
+            .borrow()
+            .region_rectangles(geometry.x, geometry.y, geometry.width, geometry.height);
+        if *shell.applied_region.borrow() != region {
+            apply_window_region(window.hwnd, region.as_deref());
+            shell.applied_region.replace(region);
+        }
+    }
+
+    fn apply_notify_icon(&mut self, order: NotifyIconOrder) {
+        if self.tray.is_none() {
+            let Some(input_sender) = self.input_sender.clone() else {
+                return;
+            };
+            match RailTray::new(input_sender) {
+                Ok(tray) => self.tray = Some(tray),
+                Err(error) => {
+                    tracing::warn!(?error, "Unable to create the RAIL notification window");
+                    return;
+                }
+            }
+        }
+        if let Some(tray) = &mut self.tray {
+            tray.apply(order, &mut self.icons);
+        }
+    }
+
+    fn apply_desktop(&self, desktop: MonitoredDesktop) {
+        if let Some(z_order) = &desktop.z_order {
+            // Topmost first: raising the windows bottom-up leaves the first one on top.
+            for window in z_order.iter().rev().filter_map(|window_id| self.windows.get(window_id)) {
+                if let Err(error) = unsafe {
+                    SetWindowPos(
+                        window.hwnd,
+                        Some(HWND_TOP),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    )
+                } {
+                    tracing::debug!(?error, "Unable to order a RAIL window");
+                }
+            }
+        }
+        let Some(window) = desktop
+            .active_window_id
+            .filter(|window_id| *window_id != MonitoredDesktop::NO_ACTIVE_WINDOW)
+            .and_then(|window_id| self.windows.get(&window_id))
+        else {
+            return;
+        };
+        // Only follow the server while a projected window already has the focus, so a
+        // remote application cannot take the foreground from a local one.
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground == window.hwnd || !self.windows.values().any(|window| window.hwnd == foreground) {
+            return;
+        }
+        // UNTESTED: activation of a window on this thread delivers WM_ACTIVATE before
+        // SetForegroundWindow returns, so the suppression covers the echo. If activation
+        // were deferred, the server would receive a redundant Activate PDU.
+        window.context.shell.suppress_activation.set(true);
+        let _ = unsafe { SetForegroundWindow(window.hwnd) };
+        window.context.shell.suppress_activation.set(false);
+    }
+
+    /// Applies a RAIL server control that targets projected windows.
+    fn apply_control(&self, control: RailControlEvent) {
+        match control {
+            RailControlEvent::Cloak(cloak) => {
+                if let Some(window) = self.windows.get(&cloak.window_id) {
+                    set_window_cloak(window.hwnd, cloak.cloaked);
+                }
+            }
+            RailControlEvent::MinMaxInfo(info) => {
+                if let Some(window) = self.windows.get(&info.window_id) {
+                    window.context.shell.min_max.set(Some(info));
+                }
+            }
+            RailControlEvent::LocalMoveSize(move_size) => self.apply_local_move_size(move_size),
+            _ => {}
+        }
+    }
+
+    /// Starts or ends a server-initiated local move or resize ([MS-RDPERP] 3.2.5.2.6).
+    ///
+    /// [MS-RDPERP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdperp
+    fn apply_local_move_size(&self, move_size: LocalMoveSizePdu) {
+        let Some(window) = self.windows.get(&move_size.window_id) else {
+            return;
+        };
+        let shell = &window.context.shell;
+        if !move_size.is_start {
+            if shell.local_move_size.get().is_some() {
+                // Ends a local loop the server no longer drives; WM_EXITSIZEMOVE reports
+                // the rectangle the user left the window at.
+                let _ = unsafe { PostMessageW(Some(window.hwnd), WM_CANCELMODE, WPARAM(0), LPARAM(0)) };
+            } else {
+                // The Move/Size End PDU carries the final top-left corner (MS-RDPERP
+                // 3.2.5.2.7.4); apply it when no local loop decides the position.
+                let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+                if let Err(error) = unsafe {
+                    SetWindowPos(
+                        window.hwnd,
+                        None,
+                        i32::from(move_size.x),
+                        i32::from(move_size.y),
+                        0,
+                        0,
+                        flags,
+                    )
+                } {
+                    tracing::debug!(
+                        ?error,
+                        window_id = move_size.window_id,
+                        "Unable to apply the RAIL move/size end position"
+                    );
+                }
+            }
+            return;
+        }
+        let (command, mode) = local_move_size_command(move_size.move_size_type);
+        shell.local_move_size.set(Some(mode));
+        if mode == LocalMoveSizeMode::Mouse {
+            let button_down = [VK_LBUTTON, VK_RBUTTON]
+                .into_iter()
+                .any(|key| unsafe { GetAsyncKeyState(i32::from(key.0)) } < 0);
+            if !button_down {
+                // The button went up before the move started: end it at once.
+                finish_projected_rail_move_size(window.hwnd, &window.context);
+                return;
+            }
+            // The system's move/size loop takes the capture itself.
+            let _ = unsafe { ReleaseCapture() };
+        }
+        // Posted rather than sent: the modal loop must not run inside this dispatch.
+        if let Err(error) = unsafe { PostMessageW(Some(window.hwnd), WM_SYSCOMMAND, WPARAM(command), LPARAM(0)) } {
+            tracing::debug!(
+                ?error,
+                window_id = move_size.window_id,
+                "Unable to start a RAIL local move"
+            );
+            shell.local_move_size.set(None);
+        }
+    }
+
+    /// Paints graphics pipeline surface pixels into their RAIL windows.
+    fn apply_surface_updates(&mut self, updates: Vec<WindowUpdate>) {
+        let mut touched = BTreeSet::new();
+        for update in updates {
+            let Ok(window_id) = u32::try_from(update.window_id) else {
+                continue;
+            };
+            if !self.surfaces.contains_key(&window_id) && self.surfaces.len() >= MAX_PROJECTED_RAIL_WINDOWS {
+                continue;
+            }
+            let Some(surface) = RailWindowSurface::for_update(self.surfaces.get(&window_id), &update) else {
+                continue;
+            };
+            surface.borrow_mut().apply(&update);
+            self.surfaces.insert(window_id, Rc::clone(&surface));
+            if let Some(window) = self.windows.get(&window_id) {
+                window.context.shell.surface.replace(Some(surface));
+            }
+            touched.insert(window_id);
+        }
+        for window in touched.iter().filter_map(|window_id| self.windows.get(window_id)) {
+            unsafe {
+                let _ = InvalidateRect(Some(window.hwnd), None, false);
             }
         }
     }
@@ -6090,6 +6488,8 @@ impl RailWindowManager {
                 frame: Rc::clone(&self.frame),
                 presentation_surface: Rc::clone(&self.presentation_surface),
                 content: Rc::clone(&content_cell),
+                geometry: Rc::clone(&geometry_cell),
+                shell: RailWindowShell::default(),
                 close_pending: Cell::new(false),
                 close_queued: Cell::new(false),
                 release_pending: Cell::new(false),
@@ -6134,9 +6534,16 @@ impl RailWindowManager {
                     content: content_cell,
                     server_style,
                     server_extended_style,
-                    _context: window_context,
+                    context: window_context,
                 },
             );
+            if let Some(window) = self.windows.get(&order.window_id) {
+                window
+                    .context
+                    .shell
+                    .surface
+                    .replace(self.surfaces.get(&order.window_id).cloned());
+            }
             self.attach_waiting_children(order.window_id);
         }
 
@@ -6232,6 +6639,7 @@ impl RailWindowManager {
     }
 
     fn destroy_window(&mut self, window_id: u32) {
+        self.surfaces.remove(&window_id);
         let Some(window) = self.windows.remove(&window_id) else {
             return;
         };
@@ -6252,6 +6660,9 @@ impl RailWindowManager {
         for window_id in self.windows.keys().copied().collect::<Vec<_>>() {
             self.destroy_window(window_id);
         }
+        self.tray = None;
+        self.icons.clear();
+        self.surfaces.clear();
     }
 }
 
@@ -11118,6 +11529,16 @@ impl Control {
                         self.rail_windows.borrow_mut().consume(orders);
                     }
                 }
+                WorkerEvent::RailControl { control, .. } => {
+                    if self.rail_windows.borrow().is_enabled() {
+                        self.rail_windows.borrow().apply_control(control);
+                    }
+                }
+                WorkerEvent::RailWindowSurfaces { updates, .. } => {
+                    if self.rail_windows.borrow().is_enabled() {
+                        self.rail_windows.borrow_mut().apply_surface_updates(updates);
+                    }
+                }
                 WorkerEvent::RailExecuteResult { result, .. } => {
                     let error = if matches!(result.raw_result, 3 | 5 | 53 | 65 | 67) {
                         4
@@ -12012,7 +12433,10 @@ impl Control {
             builder
                 .with_remote_application_mode(true)
                 .with_rail_support_level(RailSupportLevel::SUPPORTED)
-                .with_rail_client_status_flags(0)
+                .with_rail_client_status_flags(
+                    ClientStatusPdu::ALLOW_LOCAL_MOVE_SIZE | ClientStatusPdu::BIDIRECTIONAL_CLOAK,
+                )
+                .with_rail_system_parameters(local_system_parameters())
         } else {
             builder
         };
@@ -12239,6 +12663,36 @@ impl Control {
                                                     &worker_event_posted,
                                                     hwnd,
                                                     WorkerEvent::RailWindowingOrders { generation, orders },
+                                                ) {
+                                                    break;
+                                                }
+                                            }
+                                            RdpOutputEvent::RailControl(control) => {
+                                                if !queue_worker_event(
+                                                    &worker_events,
+                                                    &worker_event_posted,
+                                                    hwnd,
+                                                    WorkerEvent::RailControl { generation, control },
+                                                ) {
+                                                    break;
+                                                }
+                                            }
+                                            RdpOutputEvent::WindowSurfaceUpdates(updates) => {
+                                                let updates = updates
+                                                    .into_iter()
+                                                    .map(|update| WindowUpdate {
+                                                        window_id: update.window_id,
+                                                        width: update.width,
+                                                        height: update.height,
+                                                        region: update.region,
+                                                        data: update.data,
+                                                    })
+                                                    .collect();
+                                                if !queue_worker_event(
+                                                    &worker_events,
+                                                    &worker_event_posted,
+                                                    hwnd,
+                                                    WorkerEvent::RailWindowSurfaces { generation, updates },
                                                 ) {
                                                     break;
                                                 }
@@ -17349,6 +17803,8 @@ fn queue_worker_event(
         WorkerEvent::RailWindowingOrders { .. }
         | WorkerEvent::RailExecuteResult { .. }
         | WorkerEvent::RailExecuteFailed { .. }
+        | WorkerEvent::RailControl { .. }
+        | WorkerEvent::RailWindowSurfaces { .. }
         | WorkerEvent::CertificateWarning { .. }
         | WorkerEvent::FatalError { .. }
         | WorkerEvent::Disconnected { .. }
@@ -24535,11 +24991,28 @@ try {
     }
 
     #[test]
-    fn projected_rail_suppresses_unsupported_system_commands() {
-        for command in [SC_MOVE, SC_SIZE, SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE] {
-            assert!(is_unsupported_projected_rail_system_command(WPARAM(command as usize)));
+    fn projected_rail_window_state_changes_go_to_the_server() {
+        // The low four bits of a WM_SYSCOMMAND value are reserved and ignored.
+        assert_eq!(
+            projected_rail_system_command(WPARAM(SC_MINIMIZE as usize | 0x2)),
+            Some(SystemCommand::Minimize)
+        );
+        assert_eq!(
+            projected_rail_system_command(WPARAM(SC_MAXIMIZE as usize)),
+            Some(SystemCommand::Maximize)
+        );
+        assert_eq!(
+            projected_rail_system_command(WPARAM(SC_RESTORE as usize)),
+            Some(SystemCommand::Restore)
+        );
+        // Moving and sizing run locally and are reported when they end.
+        for command in [
+            windows::Win32::UI::WindowsAndMessaging::SC_MOVE,
+            windows::Win32::UI::WindowsAndMessaging::SC_SIZE,
+            0xf060,
+        ] {
+            assert_eq!(projected_rail_system_command(WPARAM(command as usize)), None);
         }
-        assert!(!is_unsupported_projected_rail_system_command(WPARAM(0xf060)));
     }
 
     #[test]
@@ -24614,19 +25087,13 @@ try {
         input_sender
             .try_send(RdpInputEvent::FastPath(Vec::new().into()))
             .expect("fill input queue");
-        apply_projected_rail_input(
-            &window._context,
-            [Operation::KeyPressed(Scancode::from_u8(false, 0x1e))],
-        );
+        apply_projected_rail_input(&window.context, [Operation::KeyPressed(Scancode::from_u8(false, 0x1e))]);
         assert!(input_database.borrow_mut().release_all().is_empty());
         assert!(matches!(input_receiver.try_recv(), Ok(RdpInputEvent::FastPath(_))));
 
-        apply_projected_rail_input(
-            &window._context,
-            [Operation::KeyPressed(Scancode::from_u8(false, 0x1e))],
-        );
-        release_projected_rail_input(window.hwnd, &window._context);
-        assert!(window._context.release_pending.get());
+        apply_projected_rail_input(&window.context, [Operation::KeyPressed(Scancode::from_u8(false, 0x1e))]);
+        release_projected_rail_input(window.hwnd, &window.context);
+        assert!(window.context.release_pending.get());
         assert!(matches!(input_receiver.try_recv(), Ok(RdpInputEvent::FastPath(_))));
         unsafe {
             let _ = SendMessageW(
@@ -24636,7 +25103,7 @@ try {
                 Some(LPARAM(0)),
             );
         }
-        assert!(!window._context.release_pending.get());
+        assert!(!window.context.release_pending.get());
         assert!(matches!(input_receiver.try_recv(), Ok(RdpInputEvent::FastPath(_))));
         assert!(input_database.borrow_mut().release_all().is_empty());
 
