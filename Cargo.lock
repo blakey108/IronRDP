@@ -3300,6 +3300,7 @@ dependencies = [
  "nusb",
  "tokio",
  "tracing",
+ "windows",
 ]
 
 [[package]]
