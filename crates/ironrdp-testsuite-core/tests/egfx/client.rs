@@ -169,6 +169,7 @@ fn client_filters_avc_caps_without_decoder() {
     );
 }
 
+// oracle: spec MS-RDPEGFX §2.2.3.3
 #[test]
 fn client_keeps_avc_caps_with_decoder() {
     let handler = TestHandler::new();
@@ -188,6 +189,7 @@ fn client_keeps_avc_caps_with_decoder() {
     assert_eq!(caps_pdu.0[1].version, CapabilityVersion::V8);
 }
 
+// oracle: mutant version 10 sets missing or reordered with a YUV decoder
 #[test]
 fn client_advertises_avc444_with_a_yuv_decoder() {
     struct YuvDecoder;
@@ -222,6 +224,7 @@ fn client_advertises_avc444_with_a_yuv_decoder() {
     );
 }
 
+// oracle: spec MS-RDPEGFX §2.2.3.10
 #[test]
 fn client_keeps_handler_caps_that_disable_avc_without_decoder() {
     struct AvcDisabledHandler;
@@ -254,7 +257,9 @@ fn client_keeps_handler_caps_that_disable_avc_without_decoder() {
 }
 
 #[rstest]
+// oracle: spec MS-RDPEGFX §2.2.3.1
 #[case::v8_thin_client(CapabilitySet::V8 { flags: CapabilitiesV8Flags::THIN_CLIENT }, false, false, true, true)]
+// oracle: spec MS-RDPEGFX §2.2.3.2
 #[case::v8_1_avc420(
     CapabilitySet::V8_1 { flags: CapabilitiesV81Flags::AVC420_ENABLED },
     true,
@@ -262,6 +267,7 @@ fn client_keeps_handler_caps_that_disable_avc_without_decoder() {
     false,
     false
 )]
+// oracle: spec MS-RDPEGFX §2.2.3.3
 #[case::v10_avc_disabled(
     CapabilitySet::V10 { flags: CapabilitiesV10Flags::AVC_DISABLED | CapabilitiesV10Flags::SMALL_CACHE },
     false,
@@ -269,7 +275,9 @@ fn client_keeps_handler_caps_that_disable_avc_without_decoder() {
     true,
     false
 )]
+// oracle: spec MS-RDPEGFX §3.3.1.4
 #[case::v10_3_always_small(CapabilitySet::V10_3 { flags: CapabilitiesV103Flags::AVC_THIN_CLIENT }, true, true, true, true)]
+// oracle: spec MS-RDPEGFX §2.2.3.10
 #[case::v10_7_large_cache(CapabilitySet::V10_7 { flags: CapabilitiesV107Flags::empty() }, true, true, false, false)]
 fn client_reads_confirmed_flags(
     #[case] confirmed: CapabilitySet,
