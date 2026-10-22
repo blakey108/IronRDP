@@ -1,8 +1,15 @@
-//! Alpha codec (MS-RDPEGFX 2.2.4.3 `ALPHACODEC_BITMAP_STREAM`).
+//! Alpha codec ([MS-RDPEGFX] [2.2.4.3] `ALPHACODEC_BITMAP_STREAM`).
 //!
 //! The stream carries only per-pixel opacity, either raw (one byte per pixel) or run-length encoded
-//! with `CLEARCODEC_ALPHA_RLE_SEGMENT` runs (2.2.4.3.1). The color channels of the target come from
-//! an earlier command; this codec only replaces their alpha.
+//! with `CLEARCODEC_ALPHA_RLE_SEGMENT` runs ([2.2.4.3.1]). The color channels of the target come
+//! from an earlier command; this codec only replaces their alpha.
+//!
+//! [`decode`] hands the opacity to the caller run by run instead of materializing it: a twelve-byte
+//! stream can describe billions of pixels, and the caller knows which of them actually exist.
+//!
+//! [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+//! [2.2.4.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/4c14f2a6-a025-476f-aa33-30f1718bd015
+//! [2.2.4.3.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/9f003bdb-02fe-47b8-8d5e-c1422cdb4523
 
 use ironrdp_core::ReadCursor;
 
@@ -36,9 +43,39 @@ impl core::fmt::Display for AlphaDecodeError {
 
 impl core::error::Error for AlphaDecodeError {}
 
-/// Decode an `ALPHACODEC_BITMAP_STREAM` into one opacity byte per pixel, row-major, for a
-/// `width` x `height` bitmap.
-pub fn decode(data: &[u8], width: u16, height: u16) -> Result<Vec<u8>, AlphaDecodeError> {
+/// Opacity for a run of consecutive pixels, in row-major order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlphaRun<'a> {
+    /// One opacity byte per pixel.
+    Values(&'a [u8]),
+    /// `len` pixels sharing one opacity.
+    Fill { value: u8, len: usize },
+}
+
+impl AlphaRun<'_> {
+    /// Number of pixels the run covers.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Values(values) => values.len(),
+            Self::Fill { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Decode an `ALPHACODEC_BITMAP_STREAM` for a `width` x `height` bitmap.
+///
+/// `apply` receives each run with the row-major index of its first pixel. The stream is validated
+/// in full before the first call, so a malformed stream applies nothing.
+pub fn decode(
+    data: &[u8],
+    width: u16,
+    height: u16,
+    mut apply: impl FnMut(usize, AlphaRun<'_>),
+) -> Result<(), AlphaDecodeError> {
     let expected = usize::from(width) * usize::from(height);
     let mut src = ReadCursor::new(data);
     if src.len() < HEADER_SIZE {
@@ -55,23 +92,43 @@ pub fn decode(data: &[u8], width: u16, height: u16) -> Result<Vec<u8>, AlphaDeco
         if src.len() < expected {
             return Err(AlphaDecodeError::Truncated);
         }
-        return Ok(src.read_slice(expected).to_vec());
+        apply(0, AlphaRun::Values(src.read_slice(expected)));
+        return Ok(());
     }
 
-    let mut alpha = Vec::with_capacity(expected);
-    while alpha.len() < expected {
-        let (value, run_length) = read_segment(&mut src)?;
-        let remaining = expected - alpha.len();
-        if run_length > remaining {
-            return Err(AlphaDecodeError::PixelCountMismatch {
-                expected,
-                decoded: alpha.len().saturating_add(run_length),
-            });
+    // First pass: check that the runs cover exactly the bitmap, so nothing is applied from a
+    // stream that turns out to be malformed.
+    let segments = src;
+    let mut covered = 0usize;
+    let mut pass = segments.clone();
+    while covered < expected {
+        let (_, run_length) = read_segment(&mut pass)?;
+        covered = check_run(covered, run_length, expected)?;
+    }
+
+    let mut pass = segments;
+    let mut first_pixel = 0usize;
+    while first_pixel < expected {
+        let (value, len) = read_segment(&mut pass)?;
+        if len > 0 {
+            apply(first_pixel, AlphaRun::Fill { value, len });
         }
-        alpha.resize(alpha.len() + run_length, value);
+        first_pixel += len;
     }
 
-    Ok(alpha)
+    Ok(())
+}
+
+/// Advance the covered pixel count by one run, refusing a run past the end of the bitmap.
+fn check_run(covered: usize, run_length: usize, expected: usize) -> Result<usize, AlphaDecodeError> {
+    let remaining = expected - covered;
+    if run_length > remaining {
+        return Err(AlphaDecodeError::PixelCountMismatch {
+            expected,
+            decoded: covered.saturating_add(run_length),
+        });
+    }
+    Ok(covered + run_length)
 }
 
 /// Read one `CLEARCODEC_ALPHA_RLE_SEGMENT` (2.2.4.3.1): a value and its run length, whose

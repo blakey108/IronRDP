@@ -1423,6 +1423,48 @@ pub fn egfx_zgfx_decompress(data: &[u8]) {
     let _ = decompressor.decompress(data, &mut output);
 }
 
+/// Panic and sanitizer oracle for the Alpha codec decoder (MS-RDPEGFX 2.2.4.3).
+///
+/// The first four bytes choose the bitmap width and height, so the fuzzer can reach runs that
+/// overrun or undershoot the area as well as the extended run-length encodings.
+pub fn egfx_alpha_decode(data: &[u8]) {
+    let [w0, w1, h0, h1, stream @ ..] = data else {
+        return;
+    };
+    let width = u16::from_le_bytes([*w0, *w1]);
+    let height = u16::from_le_bytes([*h0, *h1]);
+    let area = usize::from(width) * usize::from(height);
+
+    let mut covered = 0usize;
+    let result = ironrdp_graphics::alpha::decode(stream, width, height, |first_pixel, run| {
+        assert_eq!(first_pixel, covered, "runs are contiguous");
+        covered += run.len();
+    });
+    if result.is_ok() {
+        assert_eq!(covered, area, "a decoded stream covers the whole bitmap");
+    }
+}
+
+/// Panic and sanitizer oracle for the RemoteFX message parser and tile decoder (MS-RDPRFX 2.2.2),
+/// as the EGFX client runs them on `RDPGFX_CODECID_CAVIDEO` payloads.
+pub fn egfx_rfx_decode(data: &[u8]) {
+    use ironrdp_graphics::rfx::{MAX_TILES_PER_MESSAGE, MessageDecoder, TILE_RGBA_LEN, TileDecoder};
+
+    let Ok(message) = MessageDecoder::new().parse(data) else {
+        return;
+    };
+    assert!(message.tile_count() <= MAX_TILES_PER_MESSAGE);
+
+    let mut tiles = TileDecoder::new();
+    for tile_set in &message.tile_sets {
+        for tile in &tile_set.tiles {
+            if let Ok(pixels) = tiles.decode(tile, &tile_set.quants, tile_set.entropy_algorithm) {
+                assert_eq!(pixels.len(), TILE_RGBA_LEN);
+            }
+        }
+    }
+}
+
 /// Surface-lifecycle state-machine oracle for the EGFX graphics pipeline client.
 ///
 /// Sibling of [`egfx_multi_frame`] with two distinct properties:

@@ -3,16 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use ironrdp_core::{Decode as _, ReadCursor, encode_vec};
 use ironrdp_dvc::{DvcMessage, DvcProcessor as _};
-use ironrdp_egfx::cache::{
-    CachedBitmap, MAX_CACHE_IMPORT_ENTRIES, PersistentCacheEntry, PersistentCacheError, PersistentCacheStore,
-    SMALL_CACHE_BYTES, SMALL_CACHE_SLOTS,
-};
+use ironrdp_egfx::cache::{CachedBitmap, PersistentCacheEntry, PersistentCacheError, PersistentCacheStore};
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::pdu::{
     CacheEntryMetadata, CacheImportOfferPdu, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu,
-    CapabilitiesConfirmPdu, CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitySet, CreateSurfacePdu, EndFramePdu,
-    EvictCacheEntryPdu, GfxPdu, MapSurfaceToOutputPdu, PixelFormat, Point, ResetGraphicsPdu, SolidFillPdu,
-    StartFramePdu, SurfaceToCachePdu, Timestamp,
+    CapabilitiesConfirmPdu, CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV103Flags, CapabilitySet,
+    CreateSurfacePdu, EndFramePdu, EvictCacheEntryPdu, GfxPdu, MapSurfaceToOutputPdu, PixelFormat, Point,
+    ResetGraphicsPdu, SolidFillPdu, StartFramePdu, SurfaceToCachePdu, Timestamp,
 };
 use ironrdp_egfx::server::{GraphicsPipelineHandler as ServerHandler, GraphicsPipelineServer, QoeMetrics, Surface};
 use ironrdp_graphics::zgfx::{Decompressor, wrap_uncompressed};
@@ -231,12 +228,14 @@ fn paste_and_read_origin(client: &mut GraphicsPipelineClient, cache_slot: u16) -
 
 #[test]
 fn no_offer_without_a_store() {
+    // oracle: spec MS-RDPEGFX §3.3.1.5 (the persistent cache is optional)
     let mut client = GraphicsPipelineClient::new(Box::new(NoopHandler), None);
     assert!(confirm(&mut client, full_cache_caps()).is_empty());
 }
 
 #[test]
 fn no_offer_from_an_empty_store() {
+    // oracle: spec MS-RDPEGFX §3.3.5.16 (the offer enumerates the persistent cache)
     let mut client = GraphicsPipelineClient::new(Box::new(NoopHandler), None)
         .with_persistent_cache(Box::new(MemoryStore::default()));
     assert!(confirm(&mut client, full_cache_caps()).is_empty());
@@ -244,6 +243,8 @@ fn no_offer_from_an_empty_store() {
 
 #[test]
 fn the_offer_follows_the_capabilities_confirm_in_store_order() {
+    // oracle: spec MS-RDPEGFX §3.3.5.16 (the offer enumerates the persistent cache) and §2.2.2.16.1
+    // (bitmapLength is the entry size in bytes)
     let store = MemoryStore::with_entries(vec![
         solid_entry(30, 8, 8, [1, 2, 3, 255]),
         solid_entry(10, 4, 4, [4, 5, 6, 255]),
@@ -277,7 +278,8 @@ fn the_offer_follows_the_capabilities_confirm_in_store_order() {
 
 #[test]
 fn the_offer_never_reaches_the_protocol_entry_limit() {
-    let entries = (0..u64::try_from(MAX_CACHE_IMPORT_ENTRIES).unwrap() + 100)
+    // oracle: spec MS-RDPEGFX §2.2.2.16 (cacheEntriesCount MUST be less than 5462)
+    let entries = (0..6000)
         .map(|cache_key| CacheEntryMetadata {
             cache_key,
             bitmap_len: 64,
@@ -288,13 +290,12 @@ fn the_offer_never_reaches_the_protocol_entry_limit() {
 
     let keys = offered_keys(&confirm(&mut client, full_cache_caps()));
 
-    // 2.2.2.16: cacheEntriesCount MUST be less than 5462.
-    assert_eq!(keys.len(), MAX_CACHE_IMPORT_ENTRIES);
-    assert!(keys.len() < 5462);
+    assert_eq!(keys.len(), 5461);
 }
 
 #[test]
 fn small_cache_limits_the_offer_to_its_bytes() {
+    // oracle: spec MS-RDPEGFX §3.3.1.4 (16 MB with SMALL_CACHE, 100 MB otherwise)
     const ENTRY_BYTES: u32 = 64 * 64 * 4;
     let entries = (0..2000)
         .map(|cache_key| CacheEntryMetadata {
@@ -311,10 +312,8 @@ fn small_cache_limits_the_offer_to_its_bytes() {
             flags: CapabilitiesV81Flags::SMALL_CACHE,
         },
     ));
-    assert_eq!(
-        small_keys.len(),
-        SMALL_CACHE_BYTES / usize::try_from(ENTRY_BYTES).unwrap()
-    );
+    // 16 MiB of 16 KiB entries.
+    assert_eq!(small_keys.len(), 1024);
 
     let mut full = GraphicsPipelineClient::new(Box::new(NoopHandler), None)
         .with_persistent_cache(Box::new(MetadataStore(entries)));
@@ -323,7 +322,8 @@ fn small_cache_limits_the_offer_to_its_bytes() {
 
 #[test]
 fn thin_client_limits_the_offer_to_the_small_cache_slots() {
-    let entries = (0..u64::from(SMALL_CACHE_SLOTS) + 500)
+    // oracle: spec MS-RDPEGFX §3.3.1.4 (4,096 slots with THINCLIENT)
+    let entries = (0..5000)
         .map(|cache_key| CacheEntryMetadata {
             cache_key,
             bitmap_len: 4,
@@ -339,11 +339,34 @@ fn thin_client_limits_the_offer_to_the_small_cache_slots() {
         },
     ));
 
-    assert_eq!(keys.len(), usize::from(SMALL_CACHE_SLOTS));
+    assert_eq!(keys.len(), 4096);
+}
+
+#[test]
+fn version_10_3_limits_the_offer_to_the_small_cache_whatever_its_flags() {
+    // oracle: spec MS-RDPEGFX §3.3.1.4 (version 10.3 constrains the cache to 16 MB, 4,096 slots)
+    let entries = (0..5000)
+        .map(|cache_key| CacheEntryMetadata {
+            cache_key,
+            bitmap_len: 4,
+        })
+        .collect();
+    let mut client = GraphicsPipelineClient::new(Box::new(NoopHandler), None)
+        .with_persistent_cache(Box::new(MetadataStore(entries)));
+
+    let keys = offered_keys(&confirm(
+        &mut client,
+        CapabilitySet::V10_3 {
+            flags: CapabilitiesV103Flags::empty(),
+        },
+    ));
+
+    assert_eq!(keys.len(), 4096);
 }
 
 #[test]
 fn duplicate_and_empty_entries_are_not_offered() {
+    // oracle: spec MS-RDPEGFX §2.2.2.16.1 (cacheKey uniquely identifies an entry)
     let entries = vec![
         CacheEntryMetadata {
             cache_key: 1,
@@ -374,6 +397,8 @@ fn duplicate_and_empty_entries_are_not_offered() {
 
 #[test]
 fn the_reply_preloads_each_accepted_entry_into_its_slot() {
+    // oracle: spec MS-RDPEGFX §2.2.2.17 (the Nth slot belongs to the Nth offered entry) and
+    // §3.3.5.17
     let store = MemoryStore::with_entries(vec![
         solid_entry(100, 4, 4, [255, 0, 0, 255]),
         solid_entry(200, 4, 4, [0, 255, 0, 255]),
@@ -401,6 +426,7 @@ fn the_reply_preloads_each_accepted_entry_into_its_slot() {
 
 #[test]
 fn a_reply_without_an_offer_is_ignored() {
+    // oracle: spec MS-RDPEGFX §2.2.2.17 (the reply refers to the most recent offer)
     let store = MemoryStore::with_entries(vec![solid_entry(100, 4, 4, [255, 0, 0, 255])]);
     let mut client =
         GraphicsPipelineClient::new(Box::new(NoopHandler), None).with_persistent_cache(Box::new(store.clone()));
@@ -415,6 +441,7 @@ fn a_reply_without_an_offer_is_ignored() {
 
 #[test]
 fn a_second_reply_to_one_offer_is_ignored() {
+    // oracle: spec MS-RDPEGFX §3.2.5.16 (one reply answers each offer)
     let store = MemoryStore::with_entries(vec![solid_entry(100, 4, 4, [255, 0, 0, 255])]);
     let mut client =
         GraphicsPipelineClient::new(Box::new(NoopHandler), None).with_persistent_cache(Box::new(store.clone()));
@@ -429,6 +456,7 @@ fn a_second_reply_to_one_offer_is_ignored() {
 
 #[test]
 fn reply_slots_outside_the_confirmed_cache_are_skipped() {
+    // oracle: spec MS-RDPEGFX §3.3.1.4 (one-based slots, 4,096 of them with SMALL_CACHE)
     let store = MemoryStore::with_entries(vec![
         solid_entry(1, 2, 2, [10, 10, 10, 255]),
         solid_entry(2, 2, 2, [20, 20, 20, 255]),
@@ -447,20 +475,18 @@ fn reply_slots_outside_the_confirmed_cache_are_skipped() {
     send(
         &mut client,
         GfxPdu::CacheImportReply(CacheImportReplyPdu {
-            cache_slots: vec![0, SMALL_CACHE_SLOTS + 1, SMALL_CACHE_SLOTS],
+            cache_slots: vec![0, 4097, 4096],
         }),
     );
 
     assert_eq!(store.state().loads, [3]);
     map_surface(&mut client, 4, 4);
-    assert_eq!(
-        paste_and_read_origin(&mut client, SMALL_CACHE_SLOTS),
-        Some([30, 30, 30, 255])
-    );
+    assert_eq!(paste_and_read_origin(&mut client, 4096), Some([30, 30, 30, 255]));
 }
 
 #[test]
 fn a_reply_naming_more_entries_than_offered_imports_only_the_offered_ones() {
+    // oracle: spec MS-RDPEGFX §2.2.2.17 (importedEntriesCount counts entries of the offer)
     let store = MemoryStore::with_entries(vec![solid_entry(7, 2, 2, [70, 70, 70, 255])]);
     let mut client =
         GraphicsPipelineClient::new(Box::new(NoopHandler), None).with_persistent_cache(Box::new(store.clone()));
@@ -478,6 +504,7 @@ fn a_reply_naming_more_entries_than_offered_imports_only_the_offered_ones() {
 
 #[test]
 fn an_entry_whose_pixels_do_not_match_its_size_is_not_imported() {
+    // oracle: mutant (importing a tile whose data does not cover its width and height)
     let mut malformed = solid_entry(1, 4, 4, [1, 1, 1, 255]);
     malformed.data.truncate(10);
     let store = MemoryStore::with_entries(vec![malformed]);
@@ -498,6 +525,7 @@ fn an_entry_whose_pixels_do_not_match_its_size_is_not_imported() {
 
 #[test]
 fn imported_entries_survive_reset_graphics_and_go_with_evict() {
+    // oracle: spec MS-RDPEGFX §3.3.5.14 (a reset only resizes the output) and §3.3.5.8 (eviction)
     let store = MemoryStore::with_entries(vec![solid_entry(42, 4, 4, [9, 8, 7, 255])]);
     let mut client = GraphicsPipelineClient::new(Box::new(NoopHandler), None).with_persistent_cache(Box::new(store));
     confirm(&mut client, full_cache_caps());
@@ -525,6 +553,9 @@ fn imported_entries_survive_reset_graphics_and_go_with_evict() {
 
 #[test]
 fn closing_saves_the_cache_most_recently_used_first() {
+    // oracle: reference awakecoding/FreeRDP@16a7c2ec2fd0:channels/rdpgfx/client/rdpgfx_main.c
+    // rdpgfx_save_persistent_cache (the cache is saved when the channel closes); the recency order
+    // is mutant (saving in slot order)
     let store = MemoryStore::default();
     let mut client =
         GraphicsPipelineClient::new(Box::new(NoopHandler), None).with_persistent_cache(Box::new(store.clone()));
@@ -571,6 +602,7 @@ fn closing_saves_the_cache_most_recently_used_first() {
 
 #[test]
 fn closing_with_an_empty_cache_keeps_what_was_stored() {
+    // oracle: mutant (an empty save that erases the stored cache)
     let store = MemoryStore::with_entries(vec![solid_entry(1, 2, 2, [1, 1, 1, 255])]);
     let mut client =
         GraphicsPipelineClient::new(Box::new(NoopHandler), None).with_persistent_cache(Box::new(store.clone()));
@@ -636,6 +668,8 @@ fn client_to_server(server: &mut GraphicsPipelineServer, messages: Vec<DvcMessag
 
 #[test]
 fn offer_and_reply_round_trip_through_the_server() {
+    // oracle: property round-trip (offer and reply through GraphicsPipelineServer) and spec
+    // MS-RDPEGFX §3.3.5.17
     let store = MemoryStore::with_entries(vec![
         solid_entry(0x1111, 4, 4, [200, 100, 50, 255]),
         solid_entry(0x2222, 4, 4, [10, 20, 30, 255]),

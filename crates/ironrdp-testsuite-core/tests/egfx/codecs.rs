@@ -260,6 +260,8 @@ fn solid(width: u16, height: u16, rgba: [u8; 4]) -> Vec<u8> {
 
 #[test]
 fn remotefx_paints_a_multi_tile_image() {
+    // oracle: spec MS-RDPEGFX §2.2.2.1 (CAVIDEO rectangles are relative to destRect) and
+    // MS-RDPRFX §2.2.2.3.4.1 (a tile sits at xIdx and yIdx times 64); colors are the test input
     const W: u16 = 100;
     const H: u16 = 70;
     // A 2x2 grid of whole tiles, red in the first column and blue in the second. The region
@@ -318,6 +320,7 @@ fn remotefx_paints_a_multi_tile_image() {
 
 #[test]
 fn remotefx_tiles_and_rectangles_are_relative_to_the_destination() {
+    // oracle: spec MS-RDPEGFX §2.2.2.1 (CAVIDEO rectangles are relative to destRect)
     const W: u16 = 128;
     const H: u16 = 128;
     let message = encode_rfx(
@@ -354,6 +357,7 @@ fn remotefx_tiles_and_rectangles_are_relative_to_the_destination() {
 
 #[test]
 fn remotefx_tiles_are_clipped_to_the_surface() {
+    // oracle: spec MS-RDPEGFX §3.3.5.1 (the bitmap is copied to the target surface)
     let message = encode_rfx(
         &solid(64, 64, [9, 9, 200, 255]),
         64,
@@ -383,6 +387,7 @@ fn remotefx_tiles_are_clipped_to_the_surface() {
 
 #[test]
 fn an_undecodable_remotefx_command_is_dropped_not_fatal() {
+    // oracle: mutant (a decode failure that ends the session or paints a partial message)
     let mut message = encode_rfx(
         &solid(64, 64, [1, 2, 3, 255]),
         64,
@@ -410,6 +415,66 @@ fn an_undecodable_remotefx_command_is_dropped_not_fatal() {
     assert!(updates.0.lock().unwrap().is_empty());
 }
 
+#[test]
+fn remotefx_decodes_the_ms_rdprfx_sample_into_the_surface() {
+    // oracle: spec MS-RDPRFX §4.2.2, §4.2.3 and §4.2.4.1 (input messages) and §4.2.4.4 (decoded
+    // pixels)
+    use crate::session::rfx::{DECODED_IMAGE, ENCODED_MESSAGES};
+
+    let (mut client, _) = client_with_surface(64, 64);
+    let output = render_frame(
+        &mut client,
+        64,
+        64,
+        vec![wire(
+            Codec1Type::RemoteFx,
+            rect(0, 0, 64, 64),
+            ENCODED_MESSAGES.to_vec(),
+        )],
+    );
+
+    let expected: Vec<u8> = DECODED_IMAGE
+        .chunks_exact(4)
+        .flat_map(|bgrx| [bgrx[2], bgrx[1], bgrx[0], 0xFF])
+        .collect();
+    assert!(output == expected, "the decoded sample differs from MS-RDPRFX 4.2.4.4");
+}
+
+#[test]
+fn remotefx_never_paints_outside_the_destination() {
+    // oracle: spec MS-RDPEGFX §2.2.2.1 (destRect bounds the bitmap data)
+    const W: u16 = 128;
+    const H: u16 = 128;
+    // A whole 64x64 tile and region, sent for a 32x32 destination that ends inside the surface.
+    let message = encode_rfx(
+        &solid(64, 64, [0, 200, 0, 255]),
+        64,
+        64,
+        vec![RfxRectangle {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        }],
+        true,
+    );
+
+    let (mut client, updates) = client_with_surface(W, H);
+    let output = render_frame(
+        &mut client,
+        W,
+        H,
+        vec![wire(Codec1Type::RemoteFx, rect(40, 50, 72, 82), message)],
+    );
+
+    let updates = updates.0.lock().unwrap();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].1, rect(40, 50, 72, 82));
+    assert_close(pixel(&output, W, 71, 81), [0, 200, 0, 255]);
+    assert_eq!(pixel(&output, W, 72, 50), [0, 0, 0, 0], "right of the destination");
+    assert_eq!(pixel(&output, W, 40, 82), [0, 0, 0, 0], "below the destination");
+}
+
 // ============================================================================
 // Alpha
 // ============================================================================
@@ -426,6 +491,8 @@ fn uncompressed(width: u16, height: u16, [r, g, b, a]: [u8; 4]) -> GfxPdu {
 
 #[test]
 fn raw_alpha_replaces_only_the_alpha_channel() {
+    // oracle: spec MS-RDPEGFX §3.3.5.1 (only the alpha channel of the target is updated) and
+    // §2.2.4.3 (raw values, top-left to bottom-right)
     let (mut client, updates) = client_with_surface(4, 2);
     // ALPHACODEC_BITMAP_STREAM: alphaSig 0x414C, compressed 0, then one byte per pixel.
     let mut alpha = vec![0x4C, 0x41, 0x00, 0x00];
@@ -454,6 +521,8 @@ fn raw_alpha_replaces_only_the_alpha_channel() {
 
 #[test]
 fn rle_alpha_applies_runs_across_rows_of_a_sub_rectangle() {
+    // oracle: spec MS-RDPEGFX §2.2.4.3.1 (each run covers the next runLengthFactor1 pixels) and
+    // §3.3.5.1 (only the alpha channel of the target is updated)
     let (mut client, _) = client_with_surface(6, 4);
     // A 4x2 rectangle at (1, 1): a run of 3 transparent pixels, then a run of 5 half-opaque ones
     // that wraps onto the second row.
@@ -480,7 +549,33 @@ fn rle_alpha_applies_runs_across_rows_of_a_sub_rectangle() {
 }
 
 #[test]
+fn an_alpha_run_far_larger_than_the_surface_paints_only_the_surface() {
+    // oracle: spec MS-RDPEGFX §2.2.4.3.1 (one runLengthFactor3 run covers the whole destination) and
+    // §3.3.5.1 (the bitmap is copied to the target surface)
+    let (mut client, _) = client_with_surface(4, 4);
+    // A 65535x65535 destination on a 4x4 surface, all of it one twelve-byte run.
+    let mut alpha = vec![0x4C, 0x41, 0x01, 0x00, 0x40, 0xFF, 0xFF, 0xFF];
+    alpha.extend_from_slice(&(65_535u32 * 65_535).to_le_bytes());
+
+    let output = render_frame(
+        &mut client,
+        4,
+        4,
+        vec![
+            uncompressed(4, 4, [5, 6, 7, 255]),
+            wire(Codec1Type::Alpha, rect(0, 0, 65_535, 65_535), alpha),
+        ],
+    );
+
+    assert_eq!(client.dropped_updates(), 0);
+    for (x, y) in [(0, 0), (3, 0), (0, 3), (3, 3)] {
+        assert_eq!(pixel(&output, 4, x, y), [5, 6, 7, 0x40]);
+    }
+}
+
+#[test]
 fn an_alpha_command_with_a_bad_signature_is_dropped() {
+    // oracle: spec MS-RDPEGFX §2.2.4.3 (alphaSig MUST be 0x414C)
     let (mut client, _) = client_with_surface(2, 1);
     let output = render_frame(
         &mut client,

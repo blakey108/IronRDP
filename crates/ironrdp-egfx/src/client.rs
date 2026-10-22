@@ -12,7 +12,7 @@
 //! - **Frame Acknowledgment**: Sends `FrameAcknowledge` after `EndFrame` ([3.3.5.12])
 //! - **Codec Dispatch**: Routes `WireToSurface1` by `codec_id` ([3.3.5.2])
 //! - **Persistent Bitmap Cache**: Offers stored cache entries after `CapabilitiesConfirm` and
-//!   preloads the slots the server accepts (3.3.5.16, 3.3.5.17), through an embedder-supplied
+//!   preloads the slots the server accepts ([3.3.5.16], [3.3.5.17]), through an embedder-supplied
 //!   [`PersistentCacheStore`]
 //!
 //! # Architecture
@@ -55,6 +55,8 @@
 //! [3.3.1.6]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/83cb08ff-c97f-4d08-b834-7aa69cdea6c5
 //! [3.3.5.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/90aba3e3-d4a8-4af1-b1bb-a94e2313bbf0
 //! [3.3.5.12]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/e3c80bff-3e4e-4e65-b7c2-c2cd6b1fb4f5
+//! [3.3.5.16]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/adf5cc51-d0b1-4533-987f-16296bbe6966
+//! [3.3.5.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/df29d040-f74b-4002-92ed-f0903b8402c3
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -63,7 +65,7 @@ use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::{ProgressiveDecoder, TILE_BYTES_PER_PIXEL, TILE_DIM};
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
-use ironrdp_graphics::rfx::{self, MessageDecoder as RfxMessageDecoder};
+use ironrdp_graphics::rfx::{self, MessageDecoder as RfxMessageDecoder, TileDecoder as RfxTileDecoder};
 use ironrdp_graphics::zgfx;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
@@ -131,7 +133,14 @@ pub struct CodecCapabilities {
     pub avc420: bool,
     /// AVC444 (H.264 4:4:4) is available
     pub avc444: bool,
-    /// Small cache mode
+    /// The bitmap cache is limited to 16 MB and 4096 slots ([MS-RDPEGFX] [3.3.1.4]).
+    ///
+    /// That is the case with `SMALL_CACHE`, with the version 8 and 8.1 `THINCLIENT` flag, and
+    /// with version 10.3, which 3.3.1.4 constrains to the small cache whatever its flags; the
+    /// full cache holds 100 MB in 25,600 slots.
+    ///
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    /// [3.3.1.4]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/d1c1540f-9bc7-4344-81e0-3cce6b845f86
     pub small_cache: bool,
     /// Thin client mode
     pub thin_client: bool,
@@ -144,13 +153,13 @@ impl CodecCapabilities {
             CapabilitySet::V8 { flags } => Self {
                 avc420: false,
                 avc444: false,
-                small_cache: flags.contains(CapabilitiesV8Flags::SMALL_CACHE),
+                small_cache: flags.intersects(CapabilitiesV8Flags::SMALL_CACHE | CapabilitiesV8Flags::THIN_CLIENT),
                 thin_client: flags.contains(CapabilitiesV8Flags::THIN_CLIENT),
             },
             CapabilitySet::V8_1 { flags } => Self {
                 avc420: flags.contains(CapabilitiesV81Flags::AVC420_ENABLED),
                 avc444: false,
-                small_cache: flags.contains(CapabilitiesV81Flags::SMALL_CACHE),
+                small_cache: flags.intersects(CapabilitiesV81Flags::SMALL_CACHE | CapabilitiesV81Flags::THIN_CLIENT),
                 thin_client: flags.contains(CapabilitiesV81Flags::THIN_CLIENT),
             },
             CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => Self {
@@ -168,7 +177,7 @@ impl CodecCapabilities {
             CapabilitySet::V10_3 { flags } => Self {
                 avc420: !flags.contains(crate::pdu::CapabilitiesV103Flags::AVC_DISABLED),
                 avc444: !flags.contains(crate::pdu::CapabilitiesV103Flags::AVC_DISABLED),
-                small_cache: false,
+                small_cache: true,
                 thin_client: flags.contains(crate::pdu::CapabilitiesV103Flags::AVC_THIN_CLIENT),
             },
             CapabilitySet::V10_4 { flags }
@@ -377,7 +386,7 @@ pub trait GraphicsPipelineHandler: Send {
     ///
     /// Per [MS-RDPEGFX 2.2.2.17].
     ///
-    /// [MS-RDPEGFX 2.2.2.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/7c7a0a5d-50c1-44b9-a2e7-44b47ce1e49d
+    /// [MS-RDPEGFX 2.2.2.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/0c4d88f8-50dc-465a-ab00-88a3fe0ec3c5
     fn on_cache_import_reply(&mut self, _pdu: &CacheImportReplyPdu) {}
 
     /// Called for PDUs that have no specific handler
@@ -422,6 +431,7 @@ pub struct GraphicsPipelineClient {
     planar_decoder: BitmapStreamDecoder,
     progressive_decoder: ProgressiveDecoder,
     rfx_decoder: RfxMessageDecoder,
+    rfx_tiles: RfxTileDecoder,
     /// Lifetime decode failures, used to throttle diagnostics.
     dropped_updates: u64,
 
@@ -458,6 +468,7 @@ impl GraphicsPipelineClient {
             planar_decoder: BitmapStreamDecoder::default(),
             progressive_decoder: ProgressiveDecoder::new(),
             rfx_decoder: RfxMessageDecoder::new(),
+            rfx_tiles: RfxTileDecoder::new(),
             dropped_updates: 0,
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
@@ -474,13 +485,14 @@ impl GraphicsPipelineClient {
         }
     }
 
-    /// Keep the bitmap cache across sessions in `store` ([MS-RDPEGFX] 3.3.1.5).
+    /// Keep the bitmap cache across sessions in `store` ([MS-RDPEGFX] [3.3.1.5]).
     ///
     /// Once the server confirms capabilities, the client offers the stored entries in a
     /// `CacheImportOffer` and loads the ones the server accepts into the slots its
     /// `CacheImportReply` assigns. When the channel closes, the bitmap cache is saved back.
     ///
     /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    /// [3.3.1.5]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/1a2abd79-889c-4207-a1c3-c8c1e1d6f117
     #[must_use]
     pub fn with_persistent_cache(mut self, store: Box<dyn PersistentCacheStore>) -> Self {
         self.persistent_cache = Some(store);
@@ -1224,9 +1236,15 @@ impl GraphicsPipelineClient {
 
     /// Decode a RemoteFX (`RDPGFX_CODECID_CAVIDEO`, 0x0003) command.
     ///
-    /// The payload is a RemoteFX message (MS-RDPRFX 2.2.2). Its tile positions and region
-    /// rectangles are relative to the top-left corner of `destRect` (MS-RDPEGFX 2.2.2.1); only the
-    /// parts of each tile inside a region rectangle are painted.
+    /// The payload is a RemoteFX message ([MS-RDPRFX] [2.2.2][rfx-2.2.2]). Its tile positions and
+    /// region rectangles are relative to the top-left corner of `destRect`
+    /// ([MS-RDPEGFX] [2.2.2.1]); only the parts of each tile inside both a region rectangle and
+    /// `destRect` are painted, and only those tiles are decoded.
+    ///
+    /// [MS-RDPRFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/62495a4a-a495-46ea-b459-5cde04c44549
+    /// [rfx-2.2.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/edd6c368-4f39-420a-bf14-a0e83c654ab7
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    /// [2.2.2.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/fb919fce-cc97-4d2b-8cf5-a737a00ef1a6
     fn decode_remotefx(
         &mut self,
         surface_id: u16,
@@ -1235,15 +1253,18 @@ impl GraphicsPipelineClient {
     ) -> PduResult<()> {
         let message = self
             .rfx_decoder
-            .decode(bitmap_data)
+            .parse(bitmap_data)
             .map_err(|e| pdu_other_err!("RemoteFX decode", source: e))?;
 
         let Some((surface_width, surface_height)) = self.surfaces.get(&surface_id).map(|s| (s.width, s.height)) else {
             return Ok(());
         };
+        // Nothing is painted outside the command destination or the surface.
+        let bound_right = u32::from(dest_rect.right.min(surface_width));
+        let bound_bottom = u32::from(dest_rect.bottom.min(surface_height));
         let clip = |left: u32, top: u32, width: u32, height: u32| {
-            let right = left.saturating_add(width).min(u32::from(surface_width));
-            let bottom = top.saturating_add(height).min(u32::from(surface_height));
+            let right = left.saturating_add(width).min(bound_right);
+            let bottom = top.saturating_add(height).min(bound_bottom);
             (left < right && top < bottom).then(|| ExclusiveRectangle {
                 left: u16::try_from(left).unwrap_or(u16::MAX),
                 top: u16::try_from(top).unwrap_or(u16::MAX),
@@ -1255,14 +1276,7 @@ impl GraphicsPipelineClient {
         let origin_x = u32::from(dest_rect.left);
         let origin_y = u32::from(dest_rect.top);
         let region: Vec<ExclusiveRectangle> = if message.rectangles.is_empty() {
-            clip(
-                origin_x,
-                origin_y,
-                u32::from(dest_rect.right.saturating_sub(dest_rect.left)),
-                u32::from(dest_rect.bottom.saturating_sub(dest_rect.top)),
-            )
-            .into_iter()
-            .collect()
+            clip(origin_x, origin_y, u32::MAX, u32::MAX).into_iter().collect()
         } else {
             message
                 .rectangles
@@ -1278,68 +1292,81 @@ impl GraphicsPipelineClient {
                 .collect()
         };
 
-        // Each tile is intersected with every rectangle; a message may carry 65,535 of each.
-        if message.tiles.len().saturating_mul(region.len()) > MAX_RFX_CLIPPING_WORK {
+        // Each tile is intersected with every rectangle and a message may carry 65,535
+        // rectangles, so bound the pairs before decoding anything.
+        if message.tile_count().saturating_mul(region.len()) > MAX_RFX_CLIPPING_WORK {
             return Err(pdu_other_err!("RemoteFX message has too many tile and rectangle pairs"));
         }
 
         let tile_size = u32::from(rfx::TILE_SIZE);
-        for tile in &message.tiles {
-            let tile_left = origin_x + u32::from(tile.x_idx) * tile_size;
-            let tile_top = origin_y + u32::from(tile.y_idx) * tile_size;
-            let Some(tile_rect) = clip(tile_left, tile_top, tile_size, tile_size) else {
-                continue;
-            };
-
-            for rect in &region {
-                let left = tile_rect.left.max(rect.left);
-                let top = tile_rect.top.max(rect.top);
-                let right = tile_rect.right.min(rect.right);
-                let bottom = tile_rect.bottom.min(rect.bottom);
-                if left >= right || top >= bottom {
+        for tile_set in &message.tile_sets {
+            for tile in &tile_set.tiles {
+                let tile_left = origin_x + u32::from(tile.x) * tile_size;
+                let tile_top = origin_y + u32::from(tile.y) * tile_size;
+                let Some(tile_rect) = clip(tile_left, tile_top, tile_size, tile_size) else {
+                    continue;
+                };
+                let visible: Vec<ExclusiveRectangle> = region
+                    .iter()
+                    .filter_map(|rect| {
+                        let left = tile_rect.left.max(rect.left);
+                        let top = tile_rect.top.max(rect.top);
+                        let right = tile_rect.right.min(rect.right);
+                        let bottom = tile_rect.bottom.min(rect.bottom);
+                        (left < right && top < bottom).then_some(ExclusiveRectangle {
+                            left,
+                            top,
+                            right,
+                            bottom,
+                        })
+                    })
+                    .collect();
+                if visible.is_empty() {
                     continue;
                 }
 
-                // Tile-local coordinates of the visible part; the subtraction cannot underflow
-                // because the intersection lies within the tile.
-                let local = ExclusiveRectangle {
-                    left: u16::try_from(u32::from(left) - tile_left).unwrap_or(u16::MAX),
-                    top: u16::try_from(u32::from(top) - tile_top).unwrap_or(u16::MAX),
-                    right: u16::try_from(u32::from(right) - tile_left).unwrap_or(u16::MAX),
-                    bottom: u16::try_from(u32::from(bottom) - tile_top).unwrap_or(u16::MAX),
-                };
-                let data = copy_frame_region(&tile.pixels, tile_size, &local);
-                let update = BitmapUpdate {
-                    surface_id,
-                    destination_rectangle: ExclusiveRectangle {
-                        left,
-                        top,
-                        right,
-                        bottom,
-                    },
-                    codec_id: Codec1Type::RemoteFx,
-                    data,
-                    width: right - left,
-                    height: bottom - top,
-                };
-                self.compositor
-                    .apply_bitmap(surface_id, &update.destination_rectangle, &update.data);
-                self.handler.on_bitmap_updated(&update);
+                let pixels = self
+                    .rfx_tiles
+                    .decode(tile, &tile_set.quants, tile_set.entropy_algorithm)
+                    .map_err(|e| pdu_other_err!("RemoteFX tile decode", source: e))?;
+
+                for destination_rectangle in visible {
+                    // INVARIANT: `destination_rectangle` lies within the tile, so its edges are at
+                    // least `tile_left` and `tile_top` and the subtractions cannot underflow.
+                    let local = ExclusiveRectangle {
+                        left: u16::try_from(u32::from(destination_rectangle.left) - tile_left).unwrap_or(u16::MAX),
+                        top: u16::try_from(u32::from(destination_rectangle.top) - tile_top).unwrap_or(u16::MAX),
+                        right: u16::try_from(u32::from(destination_rectangle.right) - tile_left).unwrap_or(u16::MAX),
+                        bottom: u16::try_from(u32::from(destination_rectangle.bottom) - tile_top).unwrap_or(u16::MAX),
+                    };
+                    let update = BitmapUpdate {
+                        surface_id,
+                        width: destination_rectangle.right - destination_rectangle.left,
+                        height: destination_rectangle.bottom - destination_rectangle.top,
+                        destination_rectangle,
+                        codec_id: Codec1Type::RemoteFx,
+                        data: copy_frame_region(pixels, tile_size, &local),
+                    };
+                    self.compositor
+                        .apply_bitmap(surface_id, &update.destination_rectangle, &update.data);
+                    self.handler.on_bitmap_updated(&update);
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Decode an Alpha codec (`RDPGFX_CODECID_ALPHA`, 0x000C) command into the surface's alpha
-    /// channel, leaving its color channels as an earlier command painted them (MS-RDPEGFX 3.3.5.1).
+    /// Decode an Alpha codec (`RDPGFX_CODECID_ALPHA`, 0x000C) command into the surface alpha
+    /// channel, leaving its color channels as an earlier command painted them
+    /// ([MS-RDPEGFX] [3.3.5.1]).
+    ///
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    /// [3.3.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/3fdfcd8d-ec4f-4b7a-8e0d-0385a840ec81
     fn decode_alpha(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
-        let dest_width = dest_rect.right - dest_rect.left;
-        let dest_height = dest_rect.bottom - dest_rect.top;
-
-        let alpha = ironrdp_graphics::alpha::decode(bitmap_data, dest_width, dest_height)
+        self.compositor
+            .apply_alpha(surface_id, dest_rect, bitmap_data)
             .map_err(|e| pdu_other_err!("Alpha decode", source: e))?;
-        self.compositor.apply_alpha(surface_id, dest_rect, &alpha);
 
         if let Some((destination_rectangle, data)) = self.compositor.read_region(surface_id, dest_rect) {
             let update = BitmapUpdate {
@@ -1355,13 +1382,17 @@ impl GraphicsPipelineClient {
         Ok(())
     }
 
-    /// Build the `CacheImportOffer` sent right after `CapabilitiesConfirm` (MS-RDPEGFX 3.3.5.16),
+    /// Build the `CacheImportOffer` sent right after `CapabilitiesConfirm` ([MS-RDPEGFX] [3.3.5.16]),
     /// or `None` without a persistent cache, a confirmed capability set, or stored entries.
+    ///
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    /// [3.3.5.16]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/adf5cc51-d0b1-4533-987f-16296bbe6966
     #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
     fn cache_import_offer(&mut self) -> Option<DvcMessage> {
         let store = self.persistent_cache.as_mut()?;
         // The cache limits depend on the confirmed flags, so without them nothing is offered.
-        let (max_slots, max_bytes) = bitmap_cache_limits(self.negotiated_caps.as_ref()?);
+        self.negotiated_caps.as_ref()?;
+        let (max_slots, max_bytes) = bitmap_cache_limits(&self.codec_caps);
 
         let stored = match store.entries() {
             Ok(entries) => entries,
@@ -1405,10 +1436,14 @@ impl GraphicsPipelineClient {
         Some(Box::new(offer) as DvcMessage)
     }
 
-    /// Load the entries the server accepted into the slots it assigned them (MS-RDPEGFX 3.3.5.17).
+    /// Load the entries the server accepted into the slots it assigned them
+    /// ([MS-RDPEGFX] [3.3.5.17]).
     ///
     /// The reply's Nth slot belongs to the Nth offered entry. An entry that cannot be loaded leaves
     /// its slot empty, so a later paste from it draws nothing, as for any other missing slot.
+    ///
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    /// [3.3.5.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/df29d040-f74b-4002-92ed-f0903b8402c3
     fn handle_cache_import_reply(&mut self, pdu: &CacheImportReplyPdu) {
         let Some(offered) = self.offered_cache_keys.take() else {
             warn!("CacheImportReply without a pending CacheImportOffer; ignoring it");
@@ -1425,10 +1460,8 @@ impl GraphicsPipelineClient {
             );
         }
 
-        let max_slots = self
-            .negotiated_caps
-            .as_ref()
-            .map_or(SMALL_CACHE_SLOTS, |caps| bitmap_cache_limits(caps).0);
+        // An offer only goes out once capabilities are confirmed, so these are the confirmed limits.
+        let (max_slots, _) = bitmap_cache_limits(&self.codec_caps);
         let mut imported = 0usize;
         let mut invalid_slots = 0usize;
         for (&cache_key, &cache_slot) in offered.iter().zip(&pdu.cache_slots) {
@@ -1628,21 +1661,9 @@ impl DvcProcessor for GraphicsPipelineClient {
 
 impl DvcClientProcessor for GraphicsPipelineClient {}
 
-/// Cache slot count and byte capacity of the bitmap cache under the confirmed capabilities
-/// (MS-RDPEGFX 3.3.1.4): the small cache with `SMALL_CACHE`, with the version 8 and 8.1
-/// `THINCLIENT` flag, or with version 10.3, and the full cache otherwise.
-fn bitmap_cache_limits(caps: &CapabilitySet) -> (u16, usize) {
-    let small = match caps {
-        CapabilitySet::V8 { flags } => {
-            flags.intersects(CapabilitiesV8Flags::SMALL_CACHE | CapabilitiesV8Flags::THIN_CLIENT)
-        }
-        CapabilitySet::V8_1 { flags } => {
-            flags.intersects(CapabilitiesV81Flags::SMALL_CACHE | CapabilitiesV81Flags::THIN_CLIENT)
-        }
-        CapabilitySet::V10_3 { .. } => true,
-        other => CodecCapabilities::from_capability_set(other).small_cache,
-    };
-    if small {
+/// Cache slot count and byte capacity of the bitmap cache under the confirmed capabilities.
+fn bitmap_cache_limits(caps: &CodecCapabilities) -> (u16, usize) {
+    if caps.small_cache {
         (SMALL_CACHE_SLOTS, SMALL_CACHE_BYTES)
     } else {
         (CACHE_SLOTS, CACHE_BYTES)

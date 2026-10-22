@@ -1,15 +1,19 @@
-//! Persistent bitmap cache ([MS-RDPEGFX] 3.3.1.5).
+//! Persistent bitmap cache ([MS-RDPEGFX] [3.3.1.5]).
 //!
-//! The bitmap cache (3.3.1.4) holds tiles the server stored with `SurfaceToCache` and pastes
+//! The bitmap cache ([3.3.1.4]) holds tiles the server stored with `SurfaceToCache` and pastes
 //! with `CacheToSurface`. A client that keeps those tiles across sessions offers their keys
-//! in `RDPGFX_CACHE_IMPORT_OFFER_PDU` (2.2.2.16) right after capability negotiation; the
-//! server answers with `RDPGFX_CACHE_IMPORT_REPLY_PDU` (2.2.2.17), naming the slot each
+//! in `RDPGFX_CACHE_IMPORT_OFFER_PDU` ([2.2.2.16]) right after capability negotiation; the
+//! server answers with `RDPGFX_CACHE_IMPORT_REPLY_PDU` ([2.2.2.17]), naming the slot each
 //! accepted entry goes into, and from then on pastes them without uploading them first.
 //!
 //! [`GraphicsPipelineClient`](crate::client::GraphicsPipelineClient) drives that exchange; where
 //! the entries live is up to the embedder, which supplies a [`PersistentCacheStore`].
 //!
 //! [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+//! [2.2.2.16]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/890f0077-dedb-4b22-8b20-ea69b9cfcacd
+//! [2.2.2.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/0c4d88f8-50dc-465a-ab00-88a3fe0ec3c5
+//! [3.3.1.4]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/d1c1540f-9bc7-4344-81e0-3cce6b845f86
+//! [3.3.1.5]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/1a2abd79-889c-4207-a1c3-c8c1e1d6f117
 
 use crate::pdu::CacheEntryMetadata;
 
@@ -55,16 +59,6 @@ pub struct CachedBitmap<'a> {
     pub height: u16,
     /// RGBA8888 pixels, row-major, exactly `width * height * 4` bytes.
     pub data: &'a [u8],
-}
-
-impl CachedBitmap<'_> {
-    /// The metadata to offer for this entry: `bitmapLength` is its pixel byte count.
-    pub fn metadata(&self) -> CacheEntryMetadata {
-        CacheEntryMetadata {
-            cache_key: self.cache_key,
-            bitmap_len: u32::try_from(self.data.len()).unwrap_or(u32::MAX),
-        }
-    }
 }
 
 /// Storage for the persistent bitmap cache, supplied by the embedder.

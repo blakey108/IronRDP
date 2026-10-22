@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 
+use ironrdp_graphics::alpha::{self, AlphaDecodeError, AlphaRun};
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use tracing::debug;
 
@@ -336,30 +337,36 @@ impl Compositor {
         self.record_dirty(surface_id, x, y, w, h);
     }
 
-    /// Replace the alpha channel of a surface sub-rectangle (an `RDPGFX_CODECID_ALPHA`
-    /// `WireToSurface1`), leaving its color channels untouched (3.3.5.1).
+    /// Replace the alpha channel of a surface sub-rectangle with an `ALPHACODEC_BITMAP_STREAM`
+    /// (an `RDPGFX_CODECID_ALPHA` `WireToSurface1`), leaving its color channels untouched
+    /// (MS-RDPEGFX 3.3.5.1).
     ///
-    /// `alpha` holds one byte per pixel of `dest`, row-major.
-    pub(crate) fn apply_alpha(&mut self, surface_id: u16, dest: &ExclusiveRectangle, alpha: &[u8]) {
+    /// Runs are written straight into the surface, clipped to it, so a stream describing far
+    /// more pixels than the surface holds costs no allocation.
+    pub(crate) fn apply_alpha(
+        &mut self,
+        surface_id: u16,
+        dest: &ExclusiveRectangle,
+        stream: &[u8],
+    ) -> Result<(), AlphaDecodeError> {
         let x = dest.left;
         let y = dest.top;
         let w = dest.right.saturating_sub(dest.left);
         let h = dest.bottom.saturating_sub(dest.top);
-        if let Some(surface) = self.surfaces.get_mut(&surface_id) {
-            let stride = usize::from(surface.width) * BYTES_PER_PIXEL;
-            let cols = usize::from(w).min(usize::from(surface.width).saturating_sub(usize::from(x)));
-            let rows = usize::from(h).min(usize::from(surface.height).saturating_sub(usize::from(y)));
-            for row in 0..rows {
-                let src_row = alpha.get(row * usize::from(w)..).unwrap_or_default();
-                let base = (usize::from(y) + row) * stride + usize::from(x) * BYTES_PER_PIXEL;
-                for (col, value) in src_row.iter().take(cols).enumerate() {
-                    if let Some(pixel_alpha) = surface.data.get_mut(base + col * BYTES_PER_PIXEL + 3) {
-                        *pixel_alpha = *value;
-                    }
-                }
+
+        match self.surfaces.get_mut(&surface_id) {
+            Some(surface) => {
+                let mut canvas = surface.canvas_mut();
+                alpha::decode(stream, w, h, |first_pixel, run| {
+                    write_alpha_run(&mut canvas, (x, y, w), first_pixel, run);
+                })?;
             }
+            // Validate anyway, so a malformed command is reported the same either way.
+            None => alpha::decode(stream, w, h, |_, _| {})?,
         }
+
         self.record_dirty(surface_id, x, y, w, h);
+        Ok(())
     }
 
     /// Copy a surface sub-rectangle out, clipped to the surface. `None` if the surface does not
@@ -863,6 +870,43 @@ fn blit_region(dst: CanvasMut<'_>, x: u16, y: u16, w: u16, h: u16, src: &[u8]) {
         if dstart + copy_bytes <= dst.data.len() && sstart + copy_bytes <= src.len() {
             dst.data[dstart..dstart + copy_bytes].copy_from_slice(&src[sstart..sstart + copy_bytes]);
         }
+    }
+}
+
+/// Write one alpha run of a `w`-pixel-wide rectangle at `(x, y)` into the alpha bytes of a canvas,
+/// clipping to the canvas. `first_pixel` is the run's row-major index within the rectangle.
+fn write_alpha_run(dst: &mut CanvasMut<'_>, (x, y, w): (u16, u16, u16), first_pixel: usize, run: AlphaRun<'_>) {
+    let width = usize::from(w);
+    if width == 0 {
+        return;
+    }
+    let stride = usize::from(dst.width) * BYTES_PER_PIXEL;
+    let visible_cols = width.min(usize::from(dst.width).saturating_sub(usize::from(x)));
+    let visible_rows = usize::from(dst.height).saturating_sub(usize::from(y));
+
+    let mut pixel = first_pixel;
+    let mut offset = 0usize;
+    let len = run.len();
+    while offset < len {
+        let row = pixel / width;
+        let col = pixel % width;
+        // Rows only grow, so once one falls below the canvas the rest of the run does too.
+        if row >= visible_rows {
+            break;
+        }
+        let count = (width - col).min(len - offset);
+        let row_base = (usize::from(y) + row) * stride + usize::from(x) * BYTES_PER_PIXEL;
+        for i in 0..count.min(visible_cols.saturating_sub(col)) {
+            let value = match run {
+                AlphaRun::Values(values) => values[offset + i],
+                AlphaRun::Fill { value, .. } => value,
+            };
+            if let Some(byte) = dst.data.get_mut(row_base + (col + i) * BYTES_PER_PIXEL + 3) {
+                *byte = value;
+            }
+        }
+        pixel += count;
+        offset += count;
     }
 }
 

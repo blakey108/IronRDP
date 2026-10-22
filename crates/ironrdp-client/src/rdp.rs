@@ -1822,7 +1822,7 @@ fn egfx_client(config: &Config, client: GraphicsPipelineClient) -> GraphicsPipel
     match &config.channels.egfx_persistent_cache {
         Some(path) => {
             debug!(path = %path.display(), "Using a persistent graphics cache");
-            client.with_persistent_cache(Box::new(crate::egfx_cache::FilePersistentCache::new(path.clone())))
+            client.with_persistent_cache(Box::new(crate::egfx_cache::FilePersistentCache::new(path)))
         }
         None => client,
     }

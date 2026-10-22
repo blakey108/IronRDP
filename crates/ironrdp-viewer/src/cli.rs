@@ -141,7 +141,7 @@ struct Args {
     egfx: Option<bool>,
 
     /// Keep the graphics pipeline's bitmap cache in this file across sessions, so reconnects paint
-    /// from cached tiles. `.rdp` `bitmapcachepersistenable:i:1` uses a per-user default file
+    /// from cached tiles. `.rdp` `bitmapcachepersistenable:i:1` uses a per-user default file.
     #[clap(long, value_name = "PATH")]
     egfx_cache: Option<PathBuf>,
 

@@ -1024,21 +1024,36 @@ fn udp_and_graphics_pipeline_cli_flags_reach_the_config() {
     assert_eq!(config.udp_offer_version(), UdpVersion::V1);
 }
 
+/// Where `bitmapcachepersistenable:i:1` puts the cache, derived from the documented location
+/// rather than from `default_cache_path`.
+fn documented_default_cache_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("IronRDP").join("egfx-cache.bin"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let cache_home = match std::env::var_os("XDG_CACHE_HOME") {
+            Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+            _ => std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")),
+        };
+        cache_home.map(|dir| dir.join("ironrdp").join("egfx-cache.bin"))
+    }
+}
+
 #[test]
 fn bitmap_cache_persistence_reaches_the_graphics_cache() {
-    let rdp = "full address:s:rdp.example.com
-username:s:test-user
-ClearTextPassword:s:test-pass
-";
+    // oracle: reference Microsoft RDP file settings (bitmapcachepersistenable 1 caches bitmaps on
+    // the local computer, 0 does not); the default location is mutant (a path other than the one
+    // default_cache_path documents)
+    let rdp = "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n";
     assert_eq!(parse_config_from_rdp(rdp, &[]).channels().egfx_persistent_cache, None);
 
-    let enabled = format!(
-        "{rdp}bitmapcachepersistenable:i:1
-"
-    );
+    let enabled = format!("{rdp}bitmapcachepersistenable:i:1\n");
     assert_eq!(
         parse_config_from_rdp(&enabled, &[]).channels().egfx_persistent_cache,
-        ironrdp_client::egfx_cache::default_cache_path()
+        documented_default_cache_path()
     );
     assert_eq!(
         parse_config_from_rdp(&enabled, &["--egfx-cache", "explicit.bin"])
@@ -1047,10 +1062,7 @@ ClearTextPassword:s:test-pass
         Some(PathBuf::from("explicit.bin"))
     );
 
-    let disabled = format!(
-        "{rdp}bitmapcachepersistenable:i:0
-"
-    );
+    let disabled = format!("{rdp}bitmapcachepersistenable:i:0\n");
     assert_eq!(
         parse_config_from_rdp(&disabled, &[]).channels().egfx_persistent_cache,
         None
