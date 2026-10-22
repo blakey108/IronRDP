@@ -49,7 +49,8 @@ A redirected port is held open locally only while a remote application has it op
 On Windows, pass `--camera <NAME>` (repeatable; `*` for every camera) to redirect local cameras, or set `camerastoredirect` in a `.rdp` file.
 Raw camera frames are encoded to H.264 unless `--camera-raw` is passed.
 
-MS-RDPEVOR video optimized remoting is decoded with the Windows H.264 decoder; build with `--features openh264` to use the bundled OpenH264 sources instead (required on other platforms).
+The graphics pipeline (MS-RDPEGFX) is used by default with H.264, including AVC444, and MS-RDPEVOR video optimized remoting is accepted; both decode with the Windows H.264 decoder.
+Build with `--features openh264` to use the bundled OpenH264 sources instead (required on other platforms), and pass `--egfx=false` to keep graphics on the legacy bitmap path.
 
 To open the basic console of a local Hyper-V VM with the current Windows account:
 

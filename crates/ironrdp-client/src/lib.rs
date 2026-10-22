@@ -10,6 +10,7 @@
 #[cfg(feature = "camera")]
 pub mod camera;
 pub mod config;
+pub mod h264;
 pub mod output_channel;
 pub mod rail;
 pub mod rdp;
