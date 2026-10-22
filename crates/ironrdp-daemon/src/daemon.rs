@@ -2232,7 +2232,8 @@ async fn consume_output(
             RdpOutputEvent::LoginComplete => false,
             RdpOutputEvent::WindowingOrders(orders) => {
                 guard.rail.record(RailEventKind::WindowingOrders {
-                    byte_count: u32::try_from(orders.len()).unwrap_or(u32::MAX),
+                    byte_count: u32::try_from(orders.iter().map(ironrdp_pdu::Encode::size).sum::<usize>())
+                        .unwrap_or(u32::MAX),
                 });
                 true
             }

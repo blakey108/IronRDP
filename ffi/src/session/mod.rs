@@ -1,5 +1,28 @@
 pub mod image;
 
+fn active_stage_output(output: ironrdp::session::ActiveStageOutput) -> ffi::ActiveStageOutput {
+    let encoded_windowing_orders = match &output {
+        ironrdp::session::ActiveStageOutput::WindowingOrders(orders) => encode_slow_path_orders_update(orders),
+        _ => None,
+    };
+    ffi::ActiveStageOutput(output, encoded_windowing_orders)
+}
+
+/// Encodes windowing orders as a slow-path Orders update (MS-RDPBCGR 2.2.9.1.1.3.1.1),
+/// the byte form this API exposed before orders were decoded.
+fn encode_slow_path_orders_update(orders: &[ironrdp::pdu::window::WindowingOrder]) -> Option<Vec<u8>> {
+    let order_count = u16::try_from(orders.len()).ok()?;
+    let mut update = Vec::new();
+    update.extend_from_slice(&0u16.to_le_bytes()); // updateType: UPDATETYPE_ORDERS
+    update.extend_from_slice(&0u16.to_le_bytes()); // pad2OctetsA
+    update.extend_from_slice(&order_count.to_le_bytes()); // numberOrders
+    update.extend_from_slice(&0u16.to_le_bytes()); // pad2OctetsB
+    for order in orders {
+        update.extend_from_slice(&ironrdp::core::encode_vec(order).ok()?);
+    }
+    Some(update)
+}
+
 #[diplomat::bridge]
 pub mod ffi {
     use std::collections::VecDeque;
@@ -23,8 +46,10 @@ pub mod ffi {
         pub ironrdp::connector::connection_activation::ConnectionActivationFactory,
     );
 
+    /// The second field holds windowing orders re-encoded as a slow-path Orders update,
+    /// so the byte-oriented getter can borrow them.
     #[diplomat::opaque]
-    pub struct ActiveStageOutput(pub ironrdp::session::ActiveStageOutput);
+    pub struct ActiveStageOutput(pub ironrdp::session::ActiveStageOutput, pub Option<Vec<u8>>);
 
     #[diplomat::opaque]
     pub struct ActiveStageOutputIterator(pub VecDeque<ironrdp::session::ActiveStageOutput>);
@@ -45,7 +70,7 @@ pub mod ffi {
         }
 
         pub fn next(&mut self) -> Option<Box<ActiveStageOutput>> {
-            self.0.pop_front().map(ActiveStageOutput).map(Box::new)
+            self.0.pop_front().map(super::active_stage_output).map(Box::new)
         }
     }
 
@@ -492,7 +517,10 @@ pub mod ffi {
         #[diplomat::attr(auto, getter = "windowing_orders")]
         pub fn get_windowing_orders(&self) -> Result<Box<BytesSlice<'_>>, Box<IronRdpError>> {
             match &self.0 {
-                ironrdp::session::ActiveStageOutput::WindowingOrders(orders) => Ok(Box::new(BytesSlice(orders))),
+                ironrdp::session::ActiveStageOutput::WindowingOrders(_) => match &self.1 {
+                    Some(update) => Ok(Box::new(BytesSlice(update))),
+                    None => Err("windowing orders could not be re-encoded".into()),
+                },
                 _ => Err(IncorrectEnumTypeError::on_variant("WindowingOrders")
                     .of_enum("ActiveStageOutput")
                     .into()),
@@ -600,7 +628,7 @@ mod tests {
 
     use ironrdp::pdu::gcc::{Monitor, MonitorFlags};
 
-    use super::ffi::{ActiveStageOutput, ActiveStageOutputIterator, ActiveStageOutputType};
+    use super::ffi::{ActiveStageOutputIterator, ActiveStageOutputType};
 
     #[test]
     fn active_stage_output_iterator_preserves_response_frame_order() {
@@ -624,9 +652,39 @@ mod tests {
         assert!(iterator.next().is_none());
     }
 
+    // oracle: spec MS-RDPBCGR §2.2.9.1.1.3.1.1 and MS-RDPERP §2.2.1.3.1.2.4
+    #[test]
+    fn active_stage_output_exposes_windowing_orders_as_a_slow_path_update() {
+        use ironrdp::pdu::window::{WindowOrder, WindowOrderBody, WindowingOrder};
+
+        let output = super::active_stage_output(ironrdp::session::ActiveStageOutput::WindowingOrders(vec![
+            WindowingOrder::Window(WindowOrder {
+                window_id: 7,
+                is_new: false,
+                body: WindowOrderBody::Deleted,
+            }),
+        ]));
+
+        let Ok(update) = output.get_windowing_orders() else {
+            panic!("windowing orders should be accessible");
+        };
+        assert_eq!(
+            update.0,
+            [
+                0, 0, // updateType: UPDATETYPE_ORDERS
+                0, 0, // pad2OctetsA
+                1, 0, // numberOrders
+                0, 0, // pad2OctetsB
+                0x2e, 11, 0, // controlFlags, orderSize
+                0, 0, 0, 0x21, // fieldsPresent: WINDOW | DELETED
+                7, 0, 0, 0, // WindowId
+            ]
+        );
+    }
+
     #[test]
     fn active_stage_output_exposes_monitor_layout() {
-        let output = ActiveStageOutput(ironrdp::session::ActiveStageOutput::MonitorLayout(vec![Monitor {
+        let output = super::active_stage_output(ironrdp::session::ActiveStageOutput::MonitorLayout(vec![Monitor {
             left: -800,
             top: 0,
             right: -1,
