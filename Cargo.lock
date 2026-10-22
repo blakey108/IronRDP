@@ -3592,6 +3592,7 @@ dependencies = [
  "ironrdp-cliprdr-native",
  "ironrdp-daemon",
  "ironrdp-propertyset",
+ "ironrdp-rail",
  "ironrdp-rdpdr-native",
  "ironrdp-rdpfile",
  "ironrdp-rpc",
