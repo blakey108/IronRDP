@@ -33,4 +33,10 @@ public enum ActiveStageOutputType
     WindowingOrders = 12,
     AutoReconnectFailed = 13,
     MonitorLayout = 14,
+    /// <summary>
+    /// RemoteApp window pixels from graphics pipeline surfaces mapped to RAIL windows.
+    /// The pixels are not exposed yet: this binding does not enable RemoteApp,
+    /// so servers do not map surfaces to windows.
+    /// </summary>
+    WindowSurfaceUpdates = 15,
 }
