@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use tracing::debug;
 
+use crate::cache::CachedBitmap;
 use crate::pdu::{Color, Point};
 
 const BYTES_PER_PIXEL: usize = 4;
@@ -122,10 +123,15 @@ struct CanvasMut<'a> {
 /// A cached bitmap tile (MS-RDPEGFX 3.3.1.4 bitmap cache, filled by `SurfaceToCache`, 2.2.2.6).
 #[derive(Debug)]
 struct CachedTile {
+    /// Server-assigned key, kept so the tile can be saved to the persistent cache (3.3.1.5).
+    cache_key: u64,
     width: u16,
     height: u16,
     /// RGBA8888, `width * height * 4` bytes.
     data: Vec<u8>,
+    /// Value of [`Compositor::use_clock`] when the tile was last stored or pasted, so the
+    /// persistent cache can keep the most recently used tiles first.
+    last_used: u64,
 }
 
 /// Client-side EGFX surface compositor.
@@ -138,6 +144,8 @@ struct CachedTile {
 pub(crate) struct Compositor {
     surfaces: BTreeMap<u16, Surface>,
     cache: BTreeMap<u16, CachedTile>,
+    /// Advances on every cache store or paste; orders cache tiles by recency.
+    use_clock: u64,
     /// Pixel bytes currently held across `surfaces`, `cache` and `ready`, charged
     /// against [`MAX_COMPOSITOR_BYTES`]. Kept as a running total rather than
     /// recomputed so the check before an allocation stays O(1).
@@ -328,6 +336,62 @@ impl Compositor {
         self.record_dirty(surface_id, x, y, w, h);
     }
 
+    /// Replace the alpha channel of a surface sub-rectangle (an `RDPGFX_CODECID_ALPHA`
+    /// `WireToSurface1`), leaving its color channels untouched (3.3.5.1).
+    ///
+    /// `alpha` holds one byte per pixel of `dest`, row-major.
+    pub(crate) fn apply_alpha(&mut self, surface_id: u16, dest: &ExclusiveRectangle, alpha: &[u8]) {
+        let x = dest.left;
+        let y = dest.top;
+        let w = dest.right.saturating_sub(dest.left);
+        let h = dest.bottom.saturating_sub(dest.top);
+        if let Some(surface) = self.surfaces.get_mut(&surface_id) {
+            let stride = usize::from(surface.width) * BYTES_PER_PIXEL;
+            let cols = usize::from(w).min(usize::from(surface.width).saturating_sub(usize::from(x)));
+            let rows = usize::from(h).min(usize::from(surface.height).saturating_sub(usize::from(y)));
+            for row in 0..rows {
+                let src_row = alpha.get(row * usize::from(w)..).unwrap_or_default();
+                let base = (usize::from(y) + row) * stride + usize::from(x) * BYTES_PER_PIXEL;
+                for (col, value) in src_row.iter().take(cols).enumerate() {
+                    if let Some(pixel_alpha) = surface.data.get_mut(base + col * BYTES_PER_PIXEL + 3) {
+                        *pixel_alpha = *value;
+                    }
+                }
+            }
+        }
+        self.record_dirty(surface_id, x, y, w, h);
+    }
+
+    /// Copy a surface sub-rectangle out, clipped to the surface. `None` if the surface does not
+    /// exist or the rectangle lies outside it.
+    pub(crate) fn read_region(
+        &self,
+        surface_id: u16,
+        rect: &ExclusiveRectangle,
+    ) -> Option<(ExclusiveRectangle, Vec<u8>)> {
+        let surface = self.surfaces.get(&surface_id)?;
+        let right = rect.right.min(surface.width);
+        let bottom = rect.bottom.min(surface.height);
+        if rect.left >= right || rect.top >= bottom {
+            return None;
+        }
+        let clipped = ExclusiveRectangle {
+            left: rect.left,
+            top: rect.top,
+            right,
+            bottom,
+        };
+        let data = copy_region(
+            &surface.data,
+            surface.width,
+            clipped.left,
+            clipped.top,
+            right - clipped.left,
+            bottom - clipped.top,
+        );
+        Some((clipped, data))
+    }
+
     /// Fill each rectangle of a surface with a solid, opaque color (`SolidFill`).
     pub(crate) fn solid_fill(&mut self, surface_id: u16, color: &Color, rects: &[ExclusiveRectangle]) {
         let px = [color.r, color.g, color.b, 0xFF];
@@ -386,7 +450,13 @@ impl Compositor {
 
     /// Copy a surface rectangle into a cache slot (`SurfaceToCache`). The cache is
     /// off-screen, so this produces no output delta.
-    pub(crate) fn surface_to_cache(&mut self, surface_id: u16, cache_slot: u16, src_rect: &ExclusiveRectangle) {
+    pub(crate) fn surface_to_cache(
+        &mut self,
+        surface_id: u16,
+        cache_slot: u16,
+        cache_key: u64,
+        src_rect: &ExclusiveRectangle,
+    ) {
         // Size the tile in a scope that ends the surface borrow, so the budget calls
         // below can take `&mut self` while the charge still precedes the allocation.
         let (w, h) = {
@@ -432,22 +502,82 @@ impl Compositor {
         };
 
         let data = copy_region(&surface.data, surface.width, src_rect.left, src_rect.top, w, h);
+        let last_used = self.tick();
         self.cache.insert(
             cache_slot,
             CachedTile {
+                cache_key,
                 width: w,
                 height: h,
                 data,
+                last_used,
             },
         );
+    }
+
+    /// Store a tile read back from the persistent cache into a slot the server assigned it in
+    /// `CacheImportReply` (3.3.5.17). Returns whether the tile was stored: a malformed tile, or
+    /// one the budget cannot hold, leaves the slot empty.
+    pub(crate) fn import_cache_entry(
+        &mut self,
+        cache_slot: u16,
+        cache_key: u64,
+        width: u16,
+        height: u16,
+        data: Vec<u8>,
+    ) -> bool {
+        if pixel_data_len(width, height) != Some(data.len()) {
+            return false;
+        }
+
+        // Whatever the slot held is replaced, as with `SurfaceToCache`.
+        self.evict_cache_entry(cache_slot);
+        if !self.charge(data.len()) {
+            return false;
+        }
+
+        let last_used = self.tick();
+        self.cache.insert(
+            cache_slot,
+            CachedTile {
+                cache_key,
+                width,
+                height,
+                data,
+                last_used,
+            },
+        );
+        true
+    }
+
+    /// Every cached tile, most recently used first, for saving to the persistent cache.
+    pub(crate) fn cache_entries(&self) -> Vec<CachedBitmap<'_>> {
+        let mut tiles: Vec<&CachedTile> = self.cache.values().collect();
+        tiles.sort_by_key(|tile| core::cmp::Reverse(tile.last_used));
+        tiles
+            .into_iter()
+            .map(|tile| CachedBitmap {
+                cache_key: tile.cache_key,
+                width: tile.width,
+                height: tile.height,
+                data: &tile.data,
+            })
+            .collect()
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.use_clock = self.use_clock.wrapping_add(1);
+        self.use_clock
     }
 
     /// Render a cached tile onto a surface at each destination point
     /// (`CacheToSurface`).
     pub(crate) fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dst_points: &[Point]) {
-        let Some(tile) = self.cache.get(&cache_slot) else {
+        let now = self.tick();
+        let Some(tile) = self.cache.get_mut(&cache_slot) else {
             return;
         };
+        tile.last_used = now;
         let (w, h) = (tile.width, tile.height);
 
         // `cache` and `surfaces` are disjoint fields, so the tile stays borrowed
@@ -990,7 +1120,7 @@ mod tests {
             },
             &[rect(0, 0, 8, 8)],
         );
-        c.surface_to_cache(1, 7, &rect(0, 0, 8, 8));
+        c.surface_to_cache(1, 7, 0, &rect(0, 0, 8, 8));
         c.cache_to_surface(7, 2, &[Point { x: 2, y: 2 }]);
         c.end_frame();
 
@@ -1170,7 +1300,7 @@ mod tests {
 
         c.create_surface(1, 16, 16);
         c.map_surface(1, 0, 0);
-        c.surface_to_cache(1, 7, &rect(0, 0, 16, 16));
+        c.surface_to_cache(1, 7, 0, &rect(0, 0, 16, 16));
         let cached = c.cache[&7].data.len();
         assert!(cached > 0);
 
@@ -1202,7 +1332,7 @@ mod tests {
         c.reset(1920, 1080);
         c.create_surface(1, EDGE, EDGE);
         for slot in 0..2 {
-            c.surface_to_cache(1, slot, &rect(0, 0, EDGE, EDGE));
+            c.surface_to_cache(1, slot, 0, &rect(0, 0, EDGE, EDGE));
         }
         assert_eq!(c.cache.len(), 2);
         assert!(c.cache.values().map(|tile| tile.data.len()).sum::<usize>() > MAX_BITMAP_CACHE_BYTES);
@@ -1226,11 +1356,11 @@ mod tests {
         let slots_that_fit = (MAX_COMPOSITOR_BYTES - after_surface) / after_surface;
 
         for slot in 0..u16::try_from(slots_that_fit).unwrap() {
-            c.surface_to_cache(1, slot, &rect(0, 0, EDGE, EDGE));
+            c.surface_to_cache(1, slot, 0, &rect(0, 0, EDGE, EDGE));
         }
         assert_eq!(c.cache.len(), slots_that_fit);
 
-        c.surface_to_cache(1, u16::try_from(slots_that_fit).unwrap(), &rect(0, 0, EDGE, EDGE));
+        c.surface_to_cache(1, u16::try_from(slots_that_fit).unwrap(), 0, &rect(0, 0, EDGE, EDGE));
         assert_eq!(
             c.cache.len(),
             slots_that_fit,
@@ -1248,11 +1378,11 @@ mod tests {
         c.reset(1920, 1080);
         c.create_surface(1, EDGE, EDGE);
 
-        c.surface_to_cache(1, 7, &rect(0, 0, EDGE, EDGE));
+        c.surface_to_cache(1, 7, 0, &rect(0, 0, EDGE, EDGE));
         let once = c.allocated_bytes;
 
         for _ in 0..8 {
-            c.surface_to_cache(1, 7, &rect(0, 0, EDGE, EDGE));
+            c.surface_to_cache(1, 7, 0, &rect(0, 0, EDGE, EDGE));
         }
 
         assert_eq!(c.allocated_bytes, once, "one slot must hold one charge");
@@ -1269,7 +1399,7 @@ mod tests {
         c.create_surface(1, EDGE, EDGE);
         let surface_only = c.allocated_bytes;
 
-        c.surface_to_cache(1, 7, &rect(0, 0, EDGE, EDGE));
+        c.surface_to_cache(1, 7, 0, &rect(0, 0, EDGE, EDGE));
         assert!(c.allocated_bytes > surface_only);
 
         c.evict_cache_entry(7);
@@ -1302,7 +1432,7 @@ mod tests {
             },
             &[rect(0, 0, 8, 8)],
         );
-        c.surface_to_cache(1, 7, &rect(0, 0, 8, 8));
+        c.surface_to_cache(1, 7, 0, &rect(0, 0, 8, 8));
         c.cache_to_surface(7, 2, &[Point { x: 0, y: 0 }, Point { x: 8, y: 8 }]);
         c.end_frame();
 

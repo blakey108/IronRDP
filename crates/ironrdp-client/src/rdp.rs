@@ -1817,6 +1817,17 @@ impl DvcChannelListener for RdpeaiListener {
     }
 }
 
+/// Attach the persistent bitmap cache the configuration asks for to the graphics pipeline client.
+fn egfx_client(config: &Config, client: GraphicsPipelineClient) -> GraphicsPipelineClient {
+    match &config.channels.egfx_persistent_cache {
+        Some(path) => {
+            debug!(path = %path.display(), "Using a persistent graphics cache");
+            client.with_persistent_cache(Box::new(crate::egfx_cache::FilePersistentCache::new(path.clone())))
+        }
+        None => client,
+    }
+}
+
 #[cfg(feature = "udp")]
 fn reliable_udp_multitransport_flags(enabled: bool) -> Option<ironrdp_pdu::gcc::MultiTransportFlags> {
     enabled.then_some(
@@ -1877,7 +1888,10 @@ fn build_connector(
             CsReadyFlags::ENABLE_MULTIPEN_INJECTION,
             RdpInputProtocolVersion::V300,
         ))
-        .with_dynamic_channel(GraphicsPipelineClient::new(Box::new(EgfxHandler), None));
+        .with_dynamic_channel(egfx_client(
+            config,
+            GraphicsPipelineClient::new(Box::new(EgfxHandler), None),
+        ));
 
     #[cfg(feature = "location")]
     if config.channels.location {

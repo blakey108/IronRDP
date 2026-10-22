@@ -1025,6 +1025,39 @@ fn udp_and_graphics_pipeline_cli_flags_reach_the_config() {
 }
 
 #[test]
+fn bitmap_cache_persistence_reaches_the_graphics_cache() {
+    let rdp = "full address:s:rdp.example.com
+username:s:test-user
+ClearTextPassword:s:test-pass
+";
+    assert_eq!(parse_config_from_rdp(rdp, &[]).channels().egfx_persistent_cache, None);
+
+    let enabled = format!(
+        "{rdp}bitmapcachepersistenable:i:1
+"
+    );
+    assert_eq!(
+        parse_config_from_rdp(&enabled, &[]).channels().egfx_persistent_cache,
+        ironrdp_client::egfx_cache::default_cache_path()
+    );
+    assert_eq!(
+        parse_config_from_rdp(&enabled, &["--egfx-cache", "explicit.bin"])
+            .channels()
+            .egfx_persistent_cache,
+        Some(PathBuf::from("explicit.bin"))
+    );
+
+    let disabled = format!(
+        "{rdp}bitmapcachepersistenable:i:0
+"
+    );
+    assert_eq!(
+        parse_config_from_rdp(&disabled, &[]).channels().egfx_persistent_cache,
+        None
+    );
+}
+
+#[test]
 fn udp_offer_without_udp_is_rejected() {
     let rdp = "full address:s:rdp.example.com\nusername:s:test-user\nClearTextPassword:s:test-pass\n";
 

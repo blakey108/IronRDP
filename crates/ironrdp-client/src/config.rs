@@ -1,7 +1,6 @@
 use core::fmt;
 use core::str::FromStr;
 use core::time::Duration;
-#[cfg(all(windows, feature = "dvc-com-plugin"))]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -400,6 +399,13 @@ pub struct ChannelConfig {
     /// on Windows or with the `openh264` feature) unless `videoplaybackmode:i:0` turns it off.
     #[cfg(feature = "video")]
     pub video: crate::video::VideoConfig,
+
+    /// File keeping the graphics pipeline's bitmap cache across sessions ([MS-RDPEGFX] 3.3.1.5),
+    /// so a reconnect paints from cached tiles instead of waiting for the server to resend them.
+    /// `None`, the default, keeps the cache in memory only.
+    ///
+    /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+    pub egfx_persistent_cache: Option<PathBuf>,
 }
 
 #[cfg_attr(
@@ -438,6 +444,7 @@ impl Default for ChannelConfig {
             cameras: crate::camera::CameraConfig::default(),
             #[cfg(feature = "video")]
             video: crate::video::VideoConfig::default(),
+            egfx_persistent_cache: None,
         }
     }
 }
@@ -1349,6 +1356,17 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_graphics_pipeline(mut self, enabled: bool) -> Self {
         self.graphics_pipeline = enabled;
+        self
+    }
+
+    /// Keep the graphics pipeline's bitmap cache in `path` across sessions, or only in memory with
+    /// `None` (the default).
+    ///
+    /// See [`ChannelConfig::egfx_persistent_cache`]; [`crate::egfx_cache::default_cache_path`] gives a
+    /// per-user location.
+    #[must_use]
+    pub fn with_egfx_persistent_cache(mut self, path: Option<PathBuf>) -> Self {
+        self.channels.egfx_persistent_cache = path;
         self
     }
 
@@ -2288,6 +2306,15 @@ impl ConfigBuilder {
         }
         if let Some(enabled) = ps.get::<i64>("ironrdp_egfx") {
             self.graphics_pipeline = enabled != 0;
+        }
+        // mstsc keeps one per-user bitmap cache; `1` asks for it at the default location unless a
+        // path was already chosen, `0` turns it off.
+        match ps.get::<i64>("bitmapcachepersistenable") {
+            Some(0) => self.channels.egfx_persistent_cache = None,
+            Some(_) if self.channels.egfx_persistent_cache.is_none() => {
+                self.channels.egfx_persistent_cache = crate::egfx_cache::default_cache_path();
+            }
+            _ => {}
         }
         #[cfg(feature = "video")]
         if ps.get::<i64>("videoplaybackmode") == Some(0) {
