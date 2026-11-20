@@ -134,6 +134,56 @@ fn authentication_request_carries_a_signed_assertion_over_both_nonces() {
     assert_eq!(header["kid"], POP_KEY_THUMBPRINT_KID());
 }
 
+// oracle: spec MS-RDPBCGR §2.2.18.2.1 (RDP Assertion), member order of the JWS Payload format
+#[test]
+fn assertion_payload_members_follow_the_specification_order() {
+    let mut sequence = RdsAadSequence::init(credentials(), UNIX_TIME_SECS).unwrap();
+
+    let request = authentication_request(&mut sequence);
+    let assertion = request["rdp_assertion"].as_str().unwrap();
+    let payload = URL_SAFE_NO_PAD.decode(assertion.split('.').nth(1).unwrap()).unwrap();
+    let payload = String::from_utf8(payload).unwrap();
+
+    let expected = [
+        r#"{"ts":"#,
+        r#","at":"#,
+        r#","u":"#,
+        r#","nonce":"#,
+        r#","cnf":{"jwk":{"kty":"RSA","e":"#,
+        r#","n":"#,
+        r#"}},"client_claims":"#,
+    ];
+    let mut rest = payload.as_str();
+    for member in expected {
+        let (_, after) = rest
+            .split_once(member)
+            .unwrap_or_else(|| panic!("{member} missing or out of order"));
+        rest = after;
+    }
+}
+
+// oracle: spec MS-RDPBCGR §4.11.4, the two forms of the access token scope
+#[rstest]
+#[case::hostname("DESKTOP-TEST", "ms-device-service://termsrv.wvd.microsoft.com/name/DESKTOP-TEST")]
+#[case::device_id(
+    "5d9d9c9f-1805-42e3-8c87-15208f7e175d",
+    "ms-device-service://termsrv.wvd.microsoft.com/id/5d9d9c9f-1805-42e3-8c87-15208f7e175d"
+)]
+fn assertion_names_the_resource_the_token_was_acquired_for(#[case] target: &str, #[case] resource_uri: &str) {
+    let credentials = RdsAadCredentials {
+        hostname: target.to_owned(),
+        ..credentials()
+    };
+    let mut sequence = RdsAadSequence::init(credentials, UNIX_TIME_SECS).unwrap();
+
+    let request = authentication_request(&mut sequence);
+    let assertion = request["rdp_assertion"].as_str().unwrap();
+    let payload = URL_SAFE_NO_PAD.decode(assertion.split('.').nth(1).unwrap()).unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+
+    assert_eq!(payload["u"], resource_uri);
+}
+
 /// The header `kid` is the same opaque value as `req_cnf`.
 #[expect(non_snake_case, reason = "reads as the constant it derives")]
 fn POP_KEY_THUMBPRINT_KID() -> String {

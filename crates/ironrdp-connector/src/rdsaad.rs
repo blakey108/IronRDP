@@ -29,8 +29,8 @@ use tracing::debug;
 
 use crate::{ConnectorError, ConnectorErrorKind, ConnectorResult, Written, custom_err, general_err, reason_err};
 
-/// Prefix of the token audience; the Entra ID device name of the target is appended.
-const TOKEN_AUDIENCE_PREFIX: &str = "ms-device-service://termsrv.wvd.microsoft.com/name/";
+/// Prefix of the token audience; the target follows as `id/<device ID>` or `name/<hostname>`.
+const TOKEN_AUDIENCE_PREFIX: &str = "ms-device-service://termsrv.wvd.microsoft.com/";
 
 /// Size of the RSA proof-of-possession key, as required by [MS-RDPBCGR] section 4.11.4.
 const POP_KEY_BITS: usize = 2048;
@@ -48,7 +48,9 @@ const S_OK: u32 = 0;
 ///
 /// The access token must be requested with the `req_cnf` parameter returned by
 /// [`pop_key_req_cnf`] for the same `pop_key`, and for the scope
-/// `ms-device-service://termsrv.wvd.microsoft.com/name/<hostname>/user_impersonation`.
+/// `ms-device-service://termsrv.wvd.microsoft.com/name/<hostname>/user_impersonation`, or
+/// `ms-device-service://termsrv.wvd.microsoft.com/id/<device ID>/user_impersonation` when
+/// `hostname` holds the Entra ID device ID of the target.
 #[derive(Clone)]
 pub struct RdsAadCredentials {
     /// User principal name sent in the Client Info PDU.
@@ -61,7 +63,9 @@ pub struct RdsAadCredentials {
     pub aad_nonce: String,
     /// DER-encoded PKCS#8 RSA private key the access token is bound to.
     pub pop_key: Vec<u8>,
-    /// Entra ID device name of the target, as used in the token scope.
+    /// Entra ID device name or device ID of the target, as used in the token scope.
+    ///
+    /// A value in GUID form is taken as the device ID.
     pub hostname: String,
 }
 
@@ -209,10 +213,6 @@ impl PopKey {
     fn req_cnf(&self) -> String {
         self.kid()
     }
-
-    fn public_jwk(&self) -> serde_json::Value {
-        serde_json::json!({ "kty": "RSA", "e": self.e, "n": self.n })
-    }
 }
 
 /// Finds the end of a null-terminated RDS AAD Auth PDU.
@@ -321,32 +321,61 @@ impl RdsAadSequence {
 
     /// Builds the RDP Assertion: an RS256 JWS over the access token and both nonces.
     ///
-    /// See [MS-RDPBCGR] section "2.2.18.2.1 RDP Assertion"[^assertion].
+    /// See [MS-RDPBCGR] sections "2.2.18.2.1 RDP Assertion"[^assertion] and "4.11.4 Acquiring an
+    /// RDP Access Token"[^token].
     ///
     /// [^assertion]: <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/ba819b6b-257a-466f-b8e5-f262d78677f7>
+    /// [^token]: <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/e967ebeb-9e9f-443e-857a-5208802943c2>
     fn assertion(&self, ts_nonce: &str) -> ConnectorResult<String> {
         // The aad_nonce travels as a JSON document embedded in a string.
         let client_claims = serde_json::json!({ "aad_nonce": self.credentials.aad_nonce }).to_string();
 
-        let payload = serde_json::json!({
-            "ts": self.unix_time_secs.to_string(),
-            "at": self.credentials.access_token,
-            "u": format!("{TOKEN_AUDIENCE_PREFIX}{}", self.credentials.hostname),
-            "nonce": ts_nonce,
-            "cnf": { "jwk": self.pop_key.public_jwk() },
-            "client_claims": client_claims,
-        });
+        // The token scope names the target by its device ID or by its hostname, and the
+        // resource URI has to name it the same way.
+        let target = &self.credentials.hostname;
+        let form = if is_device_id(target) { "id" } else { "name" };
+        let resource_uri = format!("{TOKEN_AUDIENCE_PREFIX}{form}/{target}");
+
+        // The members are written in the order the specification lists them, as the Microsoft
+        // clients send them, instead of through a map, which would sort the keys.
+        // Each value goes through serde_json so that it is escaped as a JSON string.
+        let string = |value: &str| serde_json::Value::from(value).to_string();
+        let payload = format!(
+            r#"{{"ts":{ts},"at":{at},"u":{u},"nonce":{nonce},"cnf":{{"jwk":{{"kty":"RSA","e":{e},"n":{n}}}}},"client_claims":{client_claims}}}"#,
+            ts = string(&self.unix_time_secs.to_string()),
+            at = string(&self.credentials.access_token),
+            u = string(&resource_uri),
+            nonce = string(ts_nonce),
+            e = string(&self.pop_key.e),
+            n = string(&self.pop_key.n),
+            client_claims = string(&client_claims),
+        );
 
         let jws = Jws {
             header: JwsHeader {
                 kid: Some(self.pop_key.kid()),
                 ..JwsHeader::new(JwsAlg::RS256)
             },
-            payload: payload.to_string().into_bytes(),
+            payload: payload.into_bytes(),
         };
 
-        jws.encode(&self.pop_key.private_key)
-            .map_err(|e| custom_err!("sign RDP assertion", e))
+        return jws
+            .encode(&self.pop_key.private_key)
+            .map_err(|e| custom_err!("sign RDP assertion", e));
+
+        /// Whether `target` is in GUID form, which a computer name is too short to be.
+        fn is_device_id(target: &str) -> bool {
+            const HYPHENS: [usize; 4] = [8, 13, 18, 23];
+
+            target.len() == 36
+                && target.bytes().enumerate().all(|(index, byte)| {
+                    if HYPHENS.contains(&index) {
+                        byte == b'-'
+                    } else {
+                        byte.is_ascii_hexdigit()
+                    }
+                })
+        }
     }
 }
 
